@@ -1,0 +1,163 @@
+prefixes:
+- /bin/zsh -lc
+allow:
+- bop jobs
+- bop nodes
+- bq
+- cargo check
+- cargo clippy
+- cargo fmt
+- cargo metadata
+- cargo test
+- cat
+- claude mcp list
+- curl
+- date
+- dbt compile
+- dbt version
+- defaults
+- dig
+- docker ps
+- file
+- find
+- flux get
+- gcloud alpha billing accounts list
+- gcloud alpha monitoring time-series list
+- gcloud beta monitoring time-series list
+- gcloud beta quotas info list
+- gcloud billing budgets list
+- gcloud compute addresses list
+- gcloud compute firewall-rules list
+- gcloud compute forwarding-rules describe
+- gcloud compute forwarding-rules list
+- gcloud compute instance-groups describe
+- gcloud compute instances describe
+- gcloud compute instances list
+- gcloud compute networks describe
+- gcloud compute networks list
+- gcloud compute networks peerings list
+- gcloud compute networks subnets describe
+- gcloud compute networks subnets list
+- gcloud compute packet-mirrorings describe
+- gcloud compute packet-mirrorings list
+- gcloud compute project-info describe
+- gcloud compute regions describe
+- gcloud compute routers describe
+- gcloud compute routers get-status
+- gcloud compute routers list
+- gcloud compute routes list
+- gcloud compute target-pools get-health
+- gcloud compute target-pools list
+- gcloud compute vpn-tunnels list
+- gcloud config get-value
+- gcloud container clusters describe
+- gcloud container clusters list
+- gcloud container get-server-config
+- gcloud container node-pools describe
+- gcloud container node-pools list
+- gcloud container operations describe
+- gcloud container operations list
+- gcloud datastream objects list
+- gcloud datastream streams describe
+- gcloud datastream streams list
+- gcloud iam service-accounts get-iam-policy
+- gcloud ids endpoints describe
+- gcloud ids endpoints list
+- gcloud logging read
+- gcloud memorystore instances describe
+- gcloud memorystore instances list
+- gcloud memorystore operations list
+- gcloud monitoring metrics-scopes list
+- gcloud monitoring time-series list
+- gcloud projects describe
+- gcloud projects list
+- gcloud quotas info list
+- gcloud redis clusters describe
+- gcloud redis instances list
+- gcloud sql instances describe
+- gcloud sql operations list
+- gcloud version
+- gh
+- git ** add
+- git ** branch
+- git ** checkout
+- git ** cherry-pick
+- git ** commit
+- git ** diff
+- git ** fetch
+- git ** grep
+- git ** log
+- git ** push
+- git ** rebase
+- git ** remote -v
+- git ** show
+- git ** status
+- git ** switch
+- git ** worktree
+- git config
+- git ls-tree
+- git reflog
+- git rev-parse
+- git rm
+- go test
+- gofmt
+- grep
+- head
+- helm get
+- helm history
+- helm list
+- jq
+- kill
+- kubectl ** describe
+- kubectl ** get
+- kubectl ** logs
+- kubectl ** port-forward
+- kubectl ** top
+- kubectl cluster-info
+- kubectl config current-context
+- kubectl config get-contexts
+- kubectl kustomize
+- kubectl rollout history
+- kubectl rollout status
+- kustomize build
+- ls
+- lsof
+- mkdir
+- nl
+- otool
+- PATH=* dbt compile
+- pg-query
+- pgrep
+- pkill
+- poetry install
+- poetry run mypy
+- poetry run pytest
+- promtool check rules
+- ps
+- pwd
+- python --version
+- rg
+- ruff
+- sed -n *,*p
+- sops
+- sort
+- ssh ** -i ~/config/dc root@* **
+- swift
+- tail
+- uv lock
+- uv run pytest
+- which
+- xcode-select
+- xcodebuild
+- xcrun
+- yq
+- zig
+deny:
+- bq ** *insert*
+- bq ** *update*
+- bq ** *delete*
+- bq ** *drop*
+- bq ** *alter*
+- bq ** *truncate*
+- bq ** *rename*
+- bq ** *create*

@@ -1,8 +1,8 @@
-# saferun-rs
+# saferun
 
-`saferun-rs` builds the `saferun` command, a small command wrapper that checks an argv command against a YAML allowlist before executing it.
+`saferun` is a simple command wrapper that executes only allowed commands. It is written in Rust and aimed to be used to limit what AI agents can safely execute without a permission prompt.
 
-It is a Rust port of the original Python `saferun` script. The program loads allow, deny, and prefix rules from a config file, decides whether the requested command is permitted, and then replaces itself with the requested process.
+The program loads allow, deny, and prefix rules from a config file, decides whether the requested command is permitted, and then replaces itself with the requested process.
 
 ## Usage
 
@@ -15,7 +15,7 @@ Examples:
 ```bash
 saferun -- git status
 saferun -- cargo test
-saferun -- kubectl -n fal get pods
+saferun -- kubectl -n monitoring get pods
 ```
 
 By default, `saferun` reads:
@@ -28,6 +28,77 @@ Use `--config` or `-c` to point at another config file:
 
 ```bash
 saferun --config ./saferun.yaml -- git status
+```
+
+This repository includes `saferun.yaml`, a checked-in policy file that mirrors
+the current local command allowlist. Use it directly while developing:
+
+```bash
+saferun --config ./saferun.yaml -- cargo test
+```
+
+Or install it as the default user policy:
+
+```bash
+mkdir -p ~/config
+cp ./saferun.yaml ~/config/saferun.yaml
+```
+
+## Agent Setup
+
+Place your saferun config at:
+
+```text
+~/config/saferun.yaml
+```
+
+Add the following shell command policy to `~/.codex/AGENTS.md` or `~/.claude/CLAUDE.md`:
+
+````markdown
+# Shell Command Policy
+
+Run all shell commands through `saferun` so each command is checked against `~/config/saferun.yaml` first.
+
+When printing commands for the user to run, omit the `saferun --` prefix. This exception applies only to displayed commands for the user; commands run by Codex must still use `saferun`.
+
+Use:
+
+```bash
+saferun -- ls
+saferun -- git status
+saferun -- kubectl get pods -n monitoring
+saferun -- kubectl -n monitoring get pods
+saferun -- gcloud compute instances list --project my-project
+```
+
+Avoid:
+
+```bash
+ls
+git status
+kubectl get pods -n monitoring
+gcloud compute instances list
+```
+````
+
+Configure agent shell permissions so only `saferun` commands are allowed.
+
+For Codex, `~/.codex/rules/default.rules` should only have:
+
+```python
+prefix_rule(pattern=["saferun"], decision="allow")
+```
+
+For Claude, `~/.claude/settings.json` should only have:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(saferun *)"
+    ]
+  }
+}
 ```
 
 ## Config
@@ -43,7 +114,7 @@ allow:
   - "git status"
   - "git diff **"
   - "cargo test **"
-  - "kubectl -n fal get pods"
+  - "kubectl -n monitoring get pods"
 
 deny:
   - "git reset **"

@@ -1,0 +1,17 @@
+[package]
+name = "saferun-rs"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "saferun"
+path = "src/main.rs"
+
+[dependencies]
+regex = "1"
+shlex = "1" # used for shell-splitting rule sources
+serde = { version = "1", features = ["derive"] }
+serde_yml = "0.0.12"
+
+[profile.release]
+strip = true

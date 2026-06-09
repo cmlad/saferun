@@ -1,8 +1,8 @@
 //! Run a command only when allowed.
 //!
-//! A faithful Rust port of the `saferun` Python script. It loads a YAML
-//! allowlist (`prefixes` / `allow` / `deny`), matches the requested command
-//! against it, and either execs the command or refuses with exit code 126.
+//! It loads a YAML allowlist (`prefixes` / `allow` / `deny`), matches the
+//! requested command against it, and either execs the command or refuses with
+//! exit code 126.
 
 use std::env;
 use std::os::unix::process::CommandExt;
@@ -47,8 +47,8 @@ struct SaferunConfig {
 
 /// Parse a rule source string into a compiled `Rule`.
 fn parse_rule(kind: &str, value: &str) -> Result<Rule, ConfigError> {
-    let parts = shlex::split(value)
-        .ok_or_else(|| ConfigError(format!("invalid {kind} rule {value:?}")))?;
+    let parts =
+        shlex::split(value).ok_or_else(|| ConfigError(format!("invalid {kind} rule {value:?}")))?;
 
     if parts.is_empty() {
         return Err(ConfigError(format!("{kind} rule cannot be empty")));
@@ -163,7 +163,9 @@ fn load_config(path: &Path) -> Result<(Vec<Rule>, Vec<Rule>, Vec<Rule>), ConfigE
         serde_yml::from_str(&text).map_err(|exc| ConfigError(exc.to_string()))?;
 
     if config.allow.is_empty() {
-        return Err(ConfigError("allow must contain at least one entry".to_string()));
+        return Err(ConfigError(
+            "allow must contain at least one entry".to_string(),
+        ));
     }
     for entries in [&config.prefixes, &config.allow, &config.deny] {
         for entry in entries {
@@ -265,9 +267,9 @@ fn find_deny_match(prefixes: &[Rule], denied: &[Rule], argv: &[String]) -> Optio
     None
 }
 
-/// Render a string the way Python's `repr` does for simple strings: wrapped in
-/// single quotes, switching to double quotes only if it contains a single quote.
-fn py_repr(value: &str) -> String {
+/// Render a short diagnostic string with quotes, switching to double quotes
+/// only if it contains a single quote.
+fn display_repr(value: &str) -> String {
     if value.contains('\'') && !value.contains('"') {
         format!("\"{value}\"")
     } else {
@@ -277,18 +279,18 @@ fn py_repr(value: &str) -> String {
 
 fn describe_match(m: &AllowMatch) -> String {
     match &m.prefix {
-        None => format!("allow={}", py_repr(&m.allow.source)),
+        None => format!("allow={}", display_repr(&m.allow.source)),
         Some(prefix) => format!(
             "prefix={}, allow={}, prefix_parts_consumed={}",
-            py_repr(&prefix.source),
-            py_repr(&m.allow.source),
+            display_repr(&prefix.source),
+            display_repr(&m.allow.source),
             m.prefix_parts_consumed
         ),
     }
 }
 
-/// Quote a single token the way Python's `shlex.quote` does: leave it bare when
-/// it only contains "safe" characters, otherwise wrap in single quotes.
+/// Quote a single shell token for display: leave it bare when it only contains
+/// "safe" characters, otherwise wrap in single quotes.
 fn shlex_quote(token: &str) -> String {
     if token.is_empty() {
         return "''".to_string();

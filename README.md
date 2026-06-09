@@ -85,7 +85,7 @@ Configure agent shell permissions so only `saferun` commands are allowed.
 
 For Codex, `~/.codex/rules/default.rules` should only have:
 
-```python
+```text
 prefix_rule(pattern=["saferun"], decision="allow")
 ```
 

@@ -2,7 +2,11 @@
 
 ## Introduction
 
-`saferun` limits what commands AI agents can execute. It support powerful matching rules and interactive prompts on MacOS. It loads `allow`, `ask`, `deny`, and `prefixes` rules, then replaces itself with an authorized command. The separate `saferun-approval` process owns the macOS approval UI and memory-only session grants.
+`saferun` limits what commands AI agents can execute. It supports powerful matching rules and interactive prompts on MacOS.
+
+Your AI agent executes all commands by passing them as arguments to `saferun`, which loads `allow`, `ask`, `deny`, and `prefixes` rules, then replaces itself with an authorized command. The separate `saferun-approval` process owns the macOS approval UI and memory-only session grants.
+
+The UI allows you to interactively approve commands which are not specifically allowed or denied, including blanket approval for the session.
 
 ## Setting Up Policy
 

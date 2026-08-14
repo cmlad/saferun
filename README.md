@@ -2,7 +2,7 @@
 
 ## Introduction
 
-`saferun` limits commands cooperative AI agents can execute. It loads `allow`, `ask`, `deny`, and `prefixes` rules, then replaces itself with an authorized command. The separate `saferun-approval` process owns the macOS approval UI and memory-only session grants.
+saferun limits what commands AI agents can execute via poweful rules and interactive promts in MacOS. It loads `allow`, `ask`, `deny`, and `prefixes` rules, then replaces itself with an authorized command. The separate `saferun-approval` process owns the macOS approval UI and memory-only session grants.
 
 ## Setting Up Policy
 
@@ -23,39 +23,33 @@ prefixes:
 allow:
   - "git status"
   - "git diff **"
-  - "cargo test **"
+  - "sed -n *,*p"
 
 ask:
   - "git push **"
-  - "kubectl -n monitoring get pods"
+  - "cp"
 
 deny:
   - "git reset **"
   - "kubectl delete **"
 ```
 
-`allow` must contain at least one entry. The other lists are optional. Rules are shell-split with `shlex` and matched case-insensitively against argv:
+`allow` must contain at least one entry. The other lists are optional:
+
+- `prefixes` recognizes leading wrappers such as `env` or `sudo` and strips them before `ask` and `allow` matching. Deny still checks both the full command and each stripped remainder.
+- `allow` executes matching commands without prompting.
+- `ask` requires interactive approval before execution.
+- `deny` blocks matching commands without prompting.
+
+Precedence is `deny`, `ask`, `allow`, then an implicit `ask` for unmatched commands.
+
+Rules are shell-split with `shlex` and matched case-insensitively against argv:
 
 - `*` matches characters within one argv item.
 - `**` matches zero or more argv items.
-- Positive rules allow trailing argv items.
-- Precedence is `deny`, `ask`, `allow`, then implicit `ask`.
-- A matching prefix strips a leading wrapper before positive matching. Deny checks the full command and every prefix-stripped remainder.
+- `ask` and `allow` rules permit trailing argv items.
 
-For example, `"sed -n *,*p"` matches both `sed -n 1,20p` and `sed -n /start/,/end/p`; its globs never consume another argv item. Quote rules containing `*` so YAML does not treat them as aliases.
-
-## Approval Scopes
-
-`Allow` approves one execution. `Allow for session` applies the dropdown's selected scope. The dropdown contains:
-
-- every prefix of the effective command, starting with its executable
-- `Matched ask rule` for a configured `ask` match
-
-The effective command is argv after stripping a recognized configured prefix. Approving the executable for `env X=1 python3 -c first` also approves `python3 -c second` and `env Y=2 python3 -c third`, but not `ruby -e …`.
-
-Shell payloads remain opaque. For `/bin/zsh -lc 'cargo test'`, the quoted payload is one argv item and is never parsed.
-
-Session grants are keyed by agent token, canonical working directory, canonical config path, and policy digest. A broker restart, key change, or cache eviction requires approval again.
+The `sed` rule above matches both `sed -n 1,20p` and `sed -n /start/,/end/p`; each `*` stays within one argv item. Quote rules containing `*` so YAML does not treat them as aliases.
 
 ## Starting the Approver
 
@@ -72,6 +66,19 @@ saferun-approval
 ```
 
 The broker listens only on `/tmp/saferun-<effective-uid>/approval.sock`. Live `ask` decisions fail closed if the broker is absent or invalid. Direct allow/deny decisions and `--dry-run` do not need it. Other Unix systems build both binaries, but live approval is macOS-only.
+
+## Approval Scopes
+
+`Allow` approves one execution. `Allow for session` applies the dropdown's selected scope. The dropdown contains:
+
+- every prefix of the effective command, starting with its executable
+- `Matched ask rule` for a configured `ask` match
+
+The effective command is argv after stripping a recognized configured prefix. Approving the executable for `env X=1 python3 -c first` also approves `python3 -c second` and `env Y=2 python3 -c third`, but not `ruby -e …`.
+
+Shell payloads remain opaque. For `/bin/zsh -lc 'cargo test'`, the quoted payload is one argv item and is never parsed.
+
+Session grants are keyed by agent token, canonical working directory, canonical config path, and policy digest. A broker restart, key change, or cache eviction requires approval again.
 
 ## AI Agent Setup
 

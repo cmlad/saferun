@@ -411,7 +411,7 @@ pub fn build_prompt(request: &ApprovalRequest) -> String {
                 request.prefix_parts_consumed
             ));
         }
-        None => prompt.push_str("Prefix rule: none (0 parts consumed)\n"),
+        None => prompt.push_str("No prefix rule\n"),
     }
     let fingerprint = request.session_digest.get(..8).unwrap_or("invalid");
     prompt.push_str(&format!("Session: {fingerprint}"));
@@ -1271,7 +1271,7 @@ mod tests {
                 "Command 3: from datetime import datetime; print(datetime.now())\n",
                 "\n",
                 "Ask rule: python3 **\n",
-                "Prefix rule: none (0 parts consumed)\n",
+                "No prefix rule\n",
                 "Session: be2f1f14"
             )
         );

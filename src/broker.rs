@@ -25,8 +25,6 @@ enum SessionGrantTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionGrantKey {
     session_digest: String,
-    cwd: Vec<u8>,
-    config_path: Vec<u8>,
     policy_digest: String,
     target: SessionGrantTarget,
 }
@@ -35,8 +33,6 @@ impl SessionGrantKey {
     fn for_target(request: &ApprovalRequest, target: SessionGrantTarget) -> Self {
         Self {
             session_digest: request.session_digest.clone(),
-            cwd: request.cwd.clone(),
-            config_path: request.config_path.clone(),
             policy_digest: request.policy_digest.clone(),
             target,
         }
@@ -1025,12 +1021,46 @@ mod tests {
     }
 
     #[test]
-    fn session_grant_isolated_by_token_directory_rule_config_and_policy() {
+    fn executable_session_grant_follows_agent_across_directories_and_equivalent_configs() {
+        let mut cache = SessionCache::with_capacity(4);
+        let mut prompter = QueuePrompter::new([PromptChoice::AllowSession(
+            SessionSelection::EffectiveCommandPrefix { parts: 1 },
+        )]);
+        let mut base = request();
+        base.command = vec!["uv".into(), "run".into(), "first.py".into()];
+        base.ask_rule_source = IMPLICIT_ASK_SOURCE.to_string();
+        base.implicit_ask = true;
+        assert_eq!(
+            exchange(&base, &mut cache, &mut prompter),
+            ApprovalDecision::Approved {
+                scope: ApprovalScope::Session
+            }
+        );
+
+        let mut changed_directory = base.clone();
+        changed_directory.cwd = b"/tmp/elsewhere".to_vec();
+        changed_directory.command[2] = "second.py".to_string();
+        let mut equivalent_config = base.clone();
+        equivalent_config.config_path = b"/tmp/equivalent.yaml".to_vec();
+        equivalent_config.command[2] = "third.py".to_string();
+        for changed in [changed_directory, equivalent_config] {
+            assert_eq!(
+                exchange(&changed, &mut cache, &mut prompter),
+                ApprovalDecision::Approved {
+                    scope: ApprovalScope::Session
+                }
+            );
+        }
+        assert_eq!(prompter.calls, 1);
+    }
+
+    #[test]
+    fn session_grant_isolated_by_token_target_and_policy() {
         let mut cache = SessionCache::with_capacity(32);
         let mut prompter = QueuePrompter::new(
             [PromptChoice::AllowSession(SessionSelection::MatchedAskRule)]
                 .into_iter()
-                .chain(std::iter::repeat_with(|| PromptChoice::Deny).take(5)),
+                .chain(std::iter::repeat_with(|| PromptChoice::Deny).take(3)),
         );
         let base = request();
         assert_eq!(
@@ -1044,15 +1074,9 @@ mod tests {
         let mut token = base.clone();
         token.session_digest = "c".repeat(64);
         variations.push(token);
-        let mut directory = base.clone();
-        directory.cwd = b"/tmp/elsewhere".to_vec();
-        variations.push(directory);
-        let mut rule = base.clone();
-        rule.ask_rule_source = "/usr/bin/touch **".to_string();
-        variations.push(rule);
-        let mut config = base.clone();
-        config.config_path = b"/tmp/other.yaml".to_vec();
-        variations.push(config);
+        let mut target = base.clone();
+        target.ask_rule_source = "/usr/bin/touch **".to_string();
+        variations.push(target);
         let mut policy = base.clone();
         policy.policy_digest = "d".repeat(64);
         variations.push(policy);
@@ -1063,7 +1087,7 @@ mod tests {
                 ApprovalDecision::Denied
             );
         }
-        assert_eq!(prompter.calls, 6);
+        assert_eq!(prompter.calls, 4);
     }
 
     #[test]

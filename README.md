@@ -8,6 +8,8 @@ Your AI agent executes all commands by passing them as arguments to `saferun`, w
 
 The UI allows you to interactively approve commands which are not specifically allowed or denied, including blanket approval for the session.
 
+![saferun approval dialog](assets/saferun-approval.png)
+
 ## Setting Up Policy
 
 By default, `saferun` reads `~/config/saferun.yaml`. Install this repository's policy with:
@@ -82,7 +84,7 @@ The effective command is argv after stripping a recognized configured prefix. Ap
 
 Shell payloads remain opaque. For `/bin/zsh -lc 'cargo test'`, the quoted payload is one argv item and is never parsed.
 
-Session grants are keyed by agent token, canonical working directory, canonical config path, and policy digest. A broker restart, key change, or cache eviction requires approval again.
+Session grants follow the agent token across working directories and equivalent config files. They are keyed by agent token, policy digest, and selected scope. A broker restart, key change, policy change, or cache eviction requires approval again.
 
 ## AI Agent Setup
 

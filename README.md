@@ -2,26 +2,18 @@
 
 ## Introduction
 
-`saferun` is a command wrapper that executes commands only when policy allows them or the user approves an interactive `ask` decision. It is written in Rust and is intended to limit what cooperative AI agents can execute.
-
-The CLI loads allow, ask, deny, and prefix rules, then replaces itself with an authorized command. A separate `saferun-approval` foreground process owns the user confirmation UI and memory-only session grants.
+`saferun` limits commands cooperative AI agents can execute. It loads `allow`, `ask`, `deny`, and `prefixes` rules, then replaces itself with an authorized command. The separate `saferun-approval` process owns the macOS approval UI and memory-only session grants.
 
 ## Setting Up Policy
 
-By default, `saferun` reads:
-
-```text
-~/config/saferun.yaml
-```
-
-This repository includes a checked-in `saferun.yaml`. Install it as the default user policy with:
+By default, `saferun` reads `~/config/saferun.yaml`. Install this repository's policy with:
 
 ```bash
 mkdir -p ~/config
 cp ./saferun.yaml ~/config/saferun.yaml
 ```
 
-The config file is YAML with four rule lists:
+The YAML config has four rule lists:
 
 ```yaml
 prefixes:
@@ -42,119 +34,90 @@ deny:
   - "kubectl delete **"
 ```
 
-`allow` is required and must contain at least one entry. `prefixes`, `ask`, and `deny` are optional.
+`allow` must contain at least one entry. The other lists are optional. Rules are shell-split with `shlex` and matched case-insensitively against argv:
 
-Rules are shell-split with `shlex`, then matched against argv parts:
+- `*` matches characters within one argv item.
+- `**` matches zero or more argv items.
+- Positive rules allow trailing argv items.
+- Precedence is `deny`, `ask`, `allow`, then implicit `ask`.
+- A matching prefix strips a leading wrapper before positive matching. Deny checks the full command and every prefix-stripped remainder.
 
-- `*` matches any characters inside one argv part.
-- `**` matches zero or more argv parts.
-- Matching is case-insensitive.
-- Positive rules permit matching commands and trailing args.
-- Decision order is: matching `deny` → deny; otherwise matching `ask` → ask; otherwise matching `allow` → allow; an unmatched command → ask.
-- A matching prefix strips a leading wrapper before positive `ask`/`allow` matching. Deny checks both the full command and every prefix-stripped remainder.
+For example, `"sed -n *,*p"` matches both `sed -n 1,20p` and `sed -n /start/,/end/p`; its globs never consume another argv item. Quote rules containing `*` so YAML does not treat them as aliases.
 
-For example, `*` can match variable text within a single argument:
+## Approval Scopes
 
-```yaml
-allow:
-  - "sed -n *,*p"
-```
+`Allow` approves one execution. `Allow for session` applies the dropdown's selected scope. The dropdown contains:
 
-This rule matches commands such as `sed -n 1,20p` and `sed -n /start/,/end/p`. Both `*` globs stay within the third argv part; they never consume another argument. Quote the complete rule so YAML treats the `*` characters as rule syntax rather than aliases.
+- every prefix of the effective command, starting with its executable
+- `Matched ask rule` for a configured `ask` match
 
-`Allow` in the confirmation dialog approves only the current execution. `Allow for session` applies the scope shown in the dialog's non-editable dropdown. The dropdown lists every prefix of the effective command plus, for a configured `ask` rule, the matched rule:
+The effective command is argv after stripping a recognized configured prefix. Approving the executable for `env X=1 python3 -c first` also approves `python3 -c second` and `env Y=2 python3 -c third`, but not `ruby -e …`.
 
-- each successive effective argv prefix, shown as the actual parts with any part longer than 8 characters truncated and suffixed with `…`; the first entry (the effective executable) is selected by default
-- `Matched ask rule` — the configured `ask` rule that matched; absent for implicit asks
+Shell payloads remain opaque. For `/bin/zsh -lc 'cargo test'`, the quoted payload is one argv item and is never parsed.
 
-The effective command is the requested argv with any recognized configured prefix stripped. Prefix scopes therefore compare the stripped argv: `env X=1 python3 -c first` approved at the executable entry also approves `python3 -c second` and `env Y=2 python3 -c third`, but never `ruby -e …`. Shell payloads such as `/bin/zsh -lc 'cargo test'` are opaque: the quoted payload is one argv part and is never parsed, so the only argv scope is that exact payload string.
+Session grants are keyed by agent token, canonical working directory, canonical config path, and policy digest. A broker restart, key change, or cache eviction requires approval again.
 
-Every session grant stays scoped to the same agent token, canonical working directory, canonical config path, and unchanged policy bytes while the broker remains running. Broker restart, token/directory/config/policy change, or safe cache eviction prompts again.
+## Starting the Approver
 
-## Starting the Agent
-
-Before starting an agent that uses `saferun`, start the approval broker in a logged-in macOS desktop session. From this repository:
+Start the broker in a logged-in macOS desktop session:
 
 ```bash
 ./start-approver.sh
 ```
 
-With an installed binary, run:
+With an installed binary:
 
 ```bash
 saferun-approval
 ```
 
-The broker listens only on `/tmp/saferun-<effective-uid>/approval.sock`. Live `ask` decisions fail closed when the broker is absent or invalid; direct allow/deny decisions and `--dry-run` do not require it. Other Unix systems build both binaries, but live `ask` decisions fail closed because the production UI uses macOS Standard Additions.
+The broker listens only on `/tmp/saferun-<effective-uid>/approval.sock`. Live `ask` decisions fail closed if the broker is absent or invalid. Direct allow/deny decisions and `--dry-run` do not need it. Other Unix systems build both binaries, but live approval is macOS-only.
 
-Create one unpredictable token file per agent session:
+## AI Agent Setup
 
-```bash
-SAFERUN_TOKEN_FILE="$(saferun session-token)"
-```
-
-`saferun session-token` creates a new `0600` file inside the UID-owned `0700` runtime directory and prints only its non-secret path. It does not load the command policy or require an existing session token. Retain that path in `SAFERUN_TOKEN_FILE` for the agent session:
+Create one token file per agent session and retain its path:
 
 ```bash
 export SAFERUN_TOKEN_FILE="$(saferun session-token)"
-saferun -- git status
-saferun -- cargo test
 ```
 
-`saferun` securely opens the file named by `SAFERUN_TOKEN_FILE`, validates its location, ownership, type, and mode, reads the token, and removes the variable before executing an authorized command. Never put the token contents in the environment, argv, or stdin. Separate agents under the same Unix UID are a cooperative boundary: file permissions prevent access by other UIDs, not a malicious same-UID process.
+`saferun session-token` creates a `0600` file in the UID-owned `0700` runtime directory and prints only its non-secret path. It does not load policy or require an existing token. `saferun` validates and reads the file, then removes `SAFERUN_TOKEN_FILE` before executing the command. Never put token contents in environment values, argv, or stdin.
 
-## Agent Setup
-
-Add the following shell command policy to `~/.codex/AGENTS.md` or `~/.claude/CLAUDE.md`:
+Add this policy to `~/.codex/AGENTS.md` or `~/.claude/CLAUDE.md`:
 
 ````markdown
 # Shell Command Policy
 
-Run all shell commands through `saferun` so each command is checked against `~/config/saferun.yaml` first. The launcher supplies `SAFERUN_TOKEN_FILE` when interactive authorization is available.
-
-When printing commands for the user to run, omit the `saferun --` prefix. This exception applies only to displayed commands; commands run by the agent must still use `saferun`.
-
-Use:
+Run every shell command through `saferun` so it is checked against `~/config/saferun.yaml`.
 
 ```bash
 saferun -- git status
 saferun -- cargo test
-saferun -- kubectl get pods -n monitoring
 saferun -- kubectl -n monitoring get pods
-saferun -- gcloud compute instances list --project my-project
 ```
 
-Avoid:
-
-```bash
-git status
-cargo test
-kubectl get pods -n monitoring
-gcloud compute instances list
-```
+When printing commands for the user, omit `saferun --`. Commands run by the agent must retain it.
 ````
 
-Configure agent shell permissions so only `saferun` commands are allowed.
+Restrict the agent's native shell permissions to `saferun`.
 
-For Codex, `~/.codex/rules/default.rules` should only have:
+For Codex, `~/.codex/rules/default.rules` should contain only:
 
 ```text
 prefix_rule(pattern=["saferun"], decision="allow")
 ```
 
-For Claude, `~/.claude/settings.json` should only have:
+For Claude, `~/.claude/settings.json` should contain only:
 
 ```json
 {
   "permissions": {
-    "allow": [
-      "Bash(saferun *)"
-    ]
+    "allow": ["Bash(saferun *)"]
   }
 }
 ```
 
-The isolation boundary is cooperative sibling agents under one Unix account. Distinct launcher tokens prevent one conforming agent from reusing another's session grants. Arbitrary same-UID code can inspect peer processes or broker traffic, and an agent allowed to substitute `--config` can replace policy; either can bypass this boundary. A stronger threat model needs a code-identity-authenticated service rather than Unix socket modes and bearer tokens.
+This is a cooperative boundary between sibling agents under one Unix account. Distinct tokens isolate conforming agents, but arbitrary same-UID code can inspect peer processes or broker traffic. An agent allowed to replace `--config` can also replace policy. A stronger threat model requires a code-identity-authenticated service.
 
 ## Usage
 
@@ -170,37 +133,33 @@ saferun -- cargo test
 saferun -- kubectl -n monitoring get pods
 ```
 
-Use `--config` or `-c` to select another policy:
+Select another policy with `--config` or `-c`:
 
 ```bash
 saferun --config ./saferun.yaml -- git status
 ```
 
-Use the repository policy directly while developing:
-
-```bash
-saferun --config ./saferun.yaml -- cargo test
-```
-
 ## Checking Rules
 
-Use `--dry-run` to classify without execution, a session token, or a running broker:
+`--dry-run` classifies without execution, a token, or a broker:
 
 ```bash
 saferun --dry-run -- git status
 saferun --dry-run -- git push origin main
 ```
 
-Directly allowed commands print `ALLOW ...`; configured ask rules and unmatched commands print `ASK ...`; both exit `0` under `--dry-run`. Explicitly denied commands print `DENIED ...` to stderr and exit `126`.
+Allowed commands print `ALLOW`; configured and implicit asks print `ASK`. Both exit `0`. Denied commands print `DENIED` to stderr and exit `126`.
 
-Use `--explain` to print the matching rule before execution:
+`--explain` prints the matching rule before execution:
 
 ```bash
 saferun --explain -- git status
 saferun --explain -- git push origin main
 ```
 
-An approved ask prints its ask/prefix match plus `approval='once'` or `approval='session'`. A session grant created through the dropdown still reports `approval='session'`; the chosen scope is not part of the response. The approval panel title is `saferun in <directory>`. Each argv item is a numbered, unquoted, reversible byte-safe line — `Prefix N` for items consumed by a recognized configured prefix and `Command N` for the effective command — followed by the matched ask rule, the matching prefix rule, and the eight-character session fingerprint. The session-scope dropdown sits beside its `Allow for session` button so the scope and the action read as one pair. Control characters, invalid UTF-8, and bidi controls are always escaped and cannot alter what appears to be authorized.
+Approved asks report `approval='once'` or `approval='session'`; the selected session scope is not part of the response.
+
+The panel title is `saferun in <directory>`. Its body lists each argv item on a numbered, unquoted, reversible byte-safe line: `Prefix N` for a recognized configured prefix and `Command N` for the effective command. Rule metadata and the eight-character session fingerprint follow. Control characters, invalid UTF-8, and bidi controls are escaped. The scope dropdown sits beside `Allow for session`.
 
 ## Build
 
@@ -208,14 +167,14 @@ An approved ask prints its ask/prefix match plus `approval='once'` or `approval=
 cargo build --release
 ```
 
-The release binaries are:
+Release binaries:
 
 ```text
 target/release/saferun
 target/release/saferun-approval
 ```
 
-For development checks:
+Development checks:
 
 ```bash
 cargo check
@@ -224,11 +183,11 @@ cargo test
 
 ## Exit Codes
 
-- `0`: the command completed successfully, or `--dry-run` classified it as `ALLOW`/`ASK`.
-- `2`: CLI argument error, invalid config, or invalid session-token input.
-- `126`: command denied, approval missing/denied/failed, or execution failed.
-- `127`: an authorized command was not found.
+- `0`: command completed, or `--dry-run` classified it as `ALLOW`/`ASK`
+- `2`: CLI argument, config, or token error
+- `126`: command denied, approval unavailable/denied/failed, or execution failed
+- `127`: authorized command not found
 
-An actual ask without `SAFERUN_TOKEN_FILE` fails closed. The referenced token must be an owned `0600` regular file created inside the UID-owned `0700` saferun runtime directory and contain exactly 64 ASCII hexadecimal bytes with an optional final LF and then EOF.
+An actual ask without `SAFERUN_TOKEN_FILE` fails closed. The token must be an owned `0600` regular file in the UID-owned `0700` runtime directory containing exactly 64 ASCII hexadecimal bytes and an optional final LF.
 
-When a command is authorized, `saferun` removes `SAFERUN_TOKEN_FILE` and uses Unix `exec`, so the wrapped command replaces it with the same PID and stdio without inheriting the token-file path.
+Authorized commands run through Unix `exec`, preserving PID and stdio without exposing the token-file path.

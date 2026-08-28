@@ -205,7 +205,8 @@ fn shell_dry_run_prints_parts_inside_outer_generic_prefix() {
             "--dry-run",
             "--",
             "env",
-            "X=1",
+            "A=1",
+            "B=2",
             "bash",
             "-c",
             "cargo test; git push origin main",
@@ -218,7 +219,7 @@ fn shell_dry_run_prints_parts_inside_outer_generic_prefix() {
         output.stdout,
         b"PART 1/2 ALLOW cargo test (allow='cargo test')\n\
           PART 2/2 ASK git push origin main (ask='git push **')\n\
-          ASK env X=1 bash -c 'cargo test; git push origin main' (shell_parts=2)\n"
+          ASK env A=1 B=2 bash -c 'cargo test; git push origin main' (shell_parts=2)\n"
     );
     assert!(output.stderr.is_empty(), "{output:?}");
 }

@@ -63,23 +63,45 @@ fn find_shell_invocation<'a>(
     policy: &Policy,
     argv: &'a [String],
 ) -> Option<ShellInvocationMatch<'a>> {
-    if let Some(prefix) = shell_prefix_matches(policy, argv).into_iter().next() {
-        return Some(ShellInvocationMatch {
-            effective_argv: argv,
-            shell_parts_consumed: prefix.parts_consumed(),
-        });
-    }
-
-    for remainder in configured_prefix_remainders(policy, argv) {
-        if let Some(prefix) = shell_prefix_matches(policy, remainder).into_iter().next() {
+    for candidate in shell_invocation_candidates(policy, argv) {
+        if let Some(prefix) = shell_prefix_matches(policy, candidate).into_iter().next() {
             return Some(ShellInvocationMatch {
-                effective_argv: remainder,
+                effective_argv: candidate,
                 shell_parts_consumed: prefix.parts_consumed(),
             });
         }
     }
 
     None
+}
+
+fn shell_invocation_candidates<'a>(policy: &Policy, argv: &'a [String]) -> Vec<&'a [String]> {
+    let mut candidates = Vec::new();
+    push_candidate(&mut candidates, argv);
+
+    let mut index = 0;
+    while index < candidates.len() {
+        let candidate = candidates[index];
+        index += 1;
+
+        for remainder in configured_prefix_remainders(policy, candidate) {
+            push_candidate(&mut candidates, remainder);
+            if let Some(effective) = strip_leading_assignments(remainder) {
+                push_candidate(&mut candidates, effective);
+            }
+        }
+    }
+
+    candidates
+}
+
+fn push_candidate<'a>(candidates: &mut Vec<&'a [String]>, candidate: &'a [String]) {
+    if candidates.iter().any(|existing| {
+        existing.as_ptr() == candidate.as_ptr() && existing.len() == candidate.len()
+    }) {
+        return;
+    }
+    candidates.push(candidate);
 }
 
 fn decompose_payload(payload: &str, parsed: Option<&ParsedPipeline>) -> Vec<ShellCommandUnit> {
@@ -209,6 +231,27 @@ fn has_unquoted_redirection(value: &str) -> bool {
     has_unquoted_meta(value, &['<', '>'])
 }
 
+fn strip_leading_assignments(argv: &[String]) -> Option<&[String]> {
+    let first_command = argv.iter().position(|part| !is_assignment(part))?;
+    if first_command == 0 {
+        None
+    } else {
+        Some(&argv[first_command..])
+    }
+}
+
+fn is_assignment(value: &str) -> bool {
+    let Some((key, _)) = value.split_once('=') else {
+        return false;
+    };
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
 fn has_unquoted_brace_expansion(value: &str) -> bool {
     has_unquoted_meta(value, &['{', '}'])
 }
@@ -334,6 +377,65 @@ mod tests {
                 ShellCommandUnit::Parsed(vec!["cargo".into(), "test".into()]),
                 ShellCommandUnit::Parsed(vec!["git".into(), "status".into()]),
             ]
+        );
+    }
+
+    #[test]
+    fn configured_generic_prefixes_strip_multiple_env_assignments_before_shell_prefixes() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let policy_path = directory.path().join("saferun.yaml");
+        std::fs::write(
+            &policy_path,
+            "prefixes:\n  - env *\nshell_prefixes:\n  - bash -c\nallow: [/bin/true]\n",
+        )
+        .expect("write policy");
+        let policy = load_policy(&policy_path).expect("load policy");
+        let argv = [
+            "env".to_string(),
+            "A=1".to_string(),
+            "B=2".to_string(),
+            "bash".to_string(),
+            "-c".to_string(),
+            "cargo test".to_string(),
+        ];
+        let invocation = analyze_shell_invocation(&policy, &argv).expect("shell invocation");
+
+        assert_eq!(
+            invocation.units,
+            vec![ShellCommandUnit::Parsed(vec![
+                "cargo".into(),
+                "test".into()
+            ])]
+        );
+    }
+
+    #[test]
+    fn stacked_configured_generic_prefixes_compose_with_shell_prefixes() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let policy_path = directory.path().join("saferun.yaml");
+        std::fs::write(
+            &policy_path,
+            "prefixes:\n  - command\n  - env *\nshell_prefixes:\n  - bash -c\nallow: [/bin/true]\n",
+        )
+        .expect("write policy");
+        let policy = load_policy(&policy_path).expect("load policy");
+        let argv = [
+            "command".to_string(),
+            "env".to_string(),
+            "A=1".to_string(),
+            "B=2".to_string(),
+            "bash".to_string(),
+            "-c".to_string(),
+            "git status".to_string(),
+        ];
+        let invocation = analyze_shell_invocation(&policy, &argv).expect("shell invocation");
+
+        assert_eq!(
+            invocation.units,
+            vec![ShellCommandUnit::Parsed(vec![
+                "git".into(),
+                "status".into()
+            ])]
         );
     }
 

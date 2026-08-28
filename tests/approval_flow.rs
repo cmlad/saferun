@@ -6,7 +6,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use saferun::approval::{read_request_frame, ApprovalScope, SocketApprovalClient};
-use saferun::authorization::{authorize_command, AuthorizationKind, AuthorizationOutcome};
+use saferun::authorization::{
+    authorize_command, authorize_invocation, AuthorizationKind, AuthorizationOutcome,
+    InvocationAuthorizationOutcome, ShellAuthorizationOutcome,
+};
 use saferun::broker::{
     handle_connection, PromptChoice, PromptError, Prompter, SessionCache, SessionSelection,
 };
@@ -344,4 +347,89 @@ fn denied_and_malformed_responses_fail_closed() {
     ));
     assert_eq!(malformed.exit_code(), Some(126));
     malformed_server.join().expect("malformed server");
+}
+
+#[test]
+fn shell_authorization_uses_session_cache_per_unit() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let config = directory.path().join("saferun.yaml");
+    std::fs::write(
+        &config,
+        "shell_prefixes: ['bash -c']\nallow: [/bin/true]\nask: ['git push **']\n",
+    )
+    .expect("write config");
+    let policy = load_policy(&config).expect("load policy");
+    let socket = directory.path().join("approval.sock");
+    let listener = bind_test_socket(&socket);
+
+    let choices = Arc::new(Mutex::new(VecDeque::from([
+        PromptChoice::AllowSession(SessionSelection::MatchedAskRule),
+        PromptChoice::Deny,
+    ])));
+    let calls = Arc::new(Mutex::new(0_usize));
+    let server_choices = Arc::clone(&choices);
+    let server_calls = Arc::clone(&calls);
+    let server = thread::spawn(move || {
+        let cache = Mutex::new(SessionCache::with_capacity(8));
+        let prompter = Mutex::new(SharedPrompter {
+            choices: server_choices,
+            calls: server_calls,
+        });
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().expect("accept");
+            handle_connection(&mut stream, &cache, &prompter).expect("dispatch");
+        }
+    });
+
+    let client = SocketApprovalClient::with_path(&socket);
+    let token = [13_u8; 32];
+    let first = authorize_invocation(
+        &policy,
+        &[
+            "bash".to_string(),
+            "-c".to_string(),
+            "git push origin main; git push origin release".to_string(),
+        ],
+        &config,
+        false,
+        Some(&token),
+        &client,
+    );
+    assert!(
+        matches!(
+            &first,
+            InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Execute {
+                aggregate_kind: AuthorizationKind::Ask,
+                ..
+            })
+        ),
+        "{first:?}"
+    );
+
+    let second = authorize_invocation(
+        &policy,
+        &[
+            "bash".to_string(),
+            "-c".to_string(),
+            "git push origin dev".to_string(),
+        ],
+        &config,
+        false,
+        Some(&token),
+        &client,
+    );
+    assert!(
+        matches!(
+            &second,
+            InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Execute {
+                aggregate_kind: AuthorizationKind::Ask,
+                ..
+            })
+        ),
+        "{second:?}"
+    );
+
+    server.join().expect("server thread");
+    assert_eq!(*calls.lock().expect("calls lock"), 1);
+    assert_eq!(choices.lock().expect("choices lock").len(), 1);
 }

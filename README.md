@@ -19,12 +19,17 @@ mkdir -p ~/config
 cp ./saferun.yaml ~/config/saferun.yaml
 ```
 
-The YAML config has four rule lists:
+The YAML config has five rule lists:
 
 ```yaml
 prefixes:
   - "env *"
   - "sudo"
+
+shell_prefixes:
+  - "bash -c"
+  - "/bin/bash -c"
+  - "/bin/zsh -lc"
 
 allow:
   - "git status"
@@ -43,6 +48,7 @@ deny:
 `allow` must contain at least one entry. The other lists are optional:
 
 - `prefixes` recognizes leading wrappers such as `env` or `sudo` and strips them before `ask` and `allow` matching. Deny still checks both the full command and each stripped remainder.
+- `shell_prefixes` recognizes explicit shell invocations whose payload should be inspected. Only configured variants are parsed; ordinary `prefixes` remain argv-only.
 - `allow` executes matching commands without prompting.
 - `ask` requires interactive approval before execution.
 - `deny` blocks matching commands without prompting.
@@ -56,6 +62,12 @@ Rules are shell-split with `shlex` and matched case-insensitively against argv:
 - `ask` and `allow` rules permit trailing argv items.
 
 The `sed` rule above matches both `sed -n 1,20p` and `sed -n /start/,/end/p`; each `*` stays within one argv item. Quote rules containing `*` so YAML does not treat them as aliases.
+
+When a configured `shell_prefixes` rule leaves exactly one payload argument, `saferun` parses that payload and authorizes each top-level literal command joined by `|`, `&&`, or `;` in source order. It still executes the original shell argv unchanged, and only after every part is authorized. Quoted or escaped separators stay part of the surrounding argument.
+
+Unsupported shell syntax is not auto-allowed. Redirections, substitutions, variables, globs, `||`, backgrounding, newlines, assignments, control flow, grouping, functions, heredocs, malformed syntax, and shell invocations with extra argv are treated as opaque implicit asks. Opaque requests are sent to the approval UI as one quoted string, so a session grant applies to that exact fragment rather than to `bash` or `zsh` broadly.
+
+Before any approval prompt, `saferun` checks the original invocation and all statically extracted commands, including commands inside opaque constructs, against `deny`. Any configured shell prefix found inside a parsed shell payload is denied without prompting.
 
 ## Starting the Approver
 
@@ -82,7 +94,7 @@ The broker listens only on `/tmp/saferun-<effective-uid>/approval.sock`. Live `a
 
 The effective command is argv after stripping a recognized configured prefix. Approving the executable for `env X=1 python3 -c first` also approves `python3 -c second` and `env Y=2 python3 -c third`, but not `ruby -e …`.
 
-Shell payloads remain opaque. For `/bin/zsh -lc 'cargo test'`, the quoted payload is one argv item and is never parsed.
+For parsed shell payloads, each component is approved independently. For `/bin/zsh -lc 'cargo test; git push origin main'`, a policy can allow `cargo test` while prompting for `git push origin main`; the shell command itself runs only if both parts are authorized.
 
 Session grants follow the agent token across working directories and equivalent config files. They are keyed by agent token, policy digest, and selected scope. A broker restart, key change, policy change, or cache eviction requires approval again.
 
@@ -171,6 +183,14 @@ saferun --explain -- git push origin main
 ```
 
 Approved asks report `approval='once'` or `approval='session'`; the selected session scope is not part of the response.
+
+For parsed shell payloads, `--dry-run` and `--explain` print each part before the aggregate decision:
+
+```text
+PART 1/2 ALLOW cargo test (allow='cargo test')
+PART 2/2 ASK git push origin main (ask='git push **')
+ASK /bin/zsh -lc 'cargo test; git push origin main' (shell_parts=2)
+```
 
 The panel title is `saferun in <directory>`. Its body lists each argv item on a numbered, unquoted, reversible byte-safe line: `Prefix N` for a recognized configured prefix and `Command N` for the effective command. Rule metadata and the eight-character session fingerprint follow. Control characters, invalid UTF-8, and bidi controls are escaped. The scope dropdown sits beside `Allow for session`.
 

@@ -1,7 +1,7 @@
 //! Run a command only when allowed or interactively approved.
 //!
-//! It loads a YAML policy (`prefixes` / `allow` / `ask` / `deny`), classifies
-//! the requested command, and either execs it or refuses with exit code 126.
+//! It loads a YAML policy, classifies the requested command, and either execs
+//! it or refuses with exit code 126.
 
 use std::env;
 use std::os::unix::process::CommandExt;
@@ -12,7 +12,10 @@ use saferun::approval::{
     create_session_token_file, read_session_token_file, ApprovalScope, SocketApprovalClient,
     SESSION_TOKEN_FILE_ENV,
 };
-use saferun::authorization::{authorize_command, AuthorizationOutcome, DENIED_EXIT_CODE};
+use saferun::authorization::{
+    authorize_invocation, AuthorizationOutcome, InvocationAuthorizationOutcome,
+    ShellAuthorizationOutcome, ShellUnitAuthorization, DENIED_EXIT_CODE,
+};
 use saferun::policy::{describe_match, load_policy, shlex_join, ConfigError};
 
 fn default_config_path() -> PathBuf {
@@ -137,7 +140,7 @@ fn run() -> i32 {
 
     let command = args.command;
     let client = SocketApprovalClient::new();
-    match authorize_command(
+    match authorize_invocation(
         &policy,
         &command,
         &args.config,
@@ -145,42 +148,66 @@ fn run() -> i32 {
         session_token.as_ref(),
         &client,
     ) {
-        AuthorizationOutcome::Denied { diagnostic } => {
+        InvocationAuthorizationOutcome::Direct(outcome) => match outcome {
+            AuthorizationOutcome::Denied { diagnostic } => {
+                if let Some(message) = diagnostic {
+                    eprintln!("{message}");
+                }
+                eprintln!("DENIED {}", shlex_join(&command));
+                return DENIED_EXIT_CODE;
+            }
+            AuthorizationOutcome::DryRun { kind, matched } => {
+                println!(
+                    "{} {} ({})",
+                    kind.label(),
+                    shlex_join(&command),
+                    describe_match(kind.rule_kind(), &matched)
+                );
+                return 0;
+            }
+            AuthorizationOutcome::Execute {
+                kind,
+                matched,
+                approval,
+            } => {
+                if args.explain {
+                    let matched = describe_match(kind.rule_kind(), &matched);
+                    match approval {
+                        Some(scope) => {
+                            let scope = match scope {
+                                ApprovalScope::Once => "once",
+                                ApprovalScope::Session => "session",
+                            };
+                            eprintln!(
+                                "ALLOW {} ({matched}, approval='{scope}')",
+                                shlex_join(&command)
+                            );
+                        }
+                        None => eprintln!("ALLOW {} ({matched})", shlex_join(&command)),
+                    }
+                }
+            }
+        },
+        InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied { diagnostic }) => {
             if let Some(message) = diagnostic {
                 eprintln!("{message}");
             }
             eprintln!("DENIED {}", shlex_join(&command));
             return DENIED_EXIT_CODE;
         }
-        AuthorizationOutcome::DryRun { kind, matched } => {
-            println!(
-                "{} {} ({})",
-                kind.label(),
-                shlex_join(&command),
-                describe_match(kind.rule_kind(), &matched)
-            );
+        InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::DryRun {
+            aggregate_kind,
+            units,
+        }) => {
+            print_shell_authorization(&command, aggregate_kind, &units, false);
             return 0;
         }
-        AuthorizationOutcome::Execute {
-            kind,
-            matched,
-            approval,
-        } => {
+        InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Execute {
+            aggregate_kind,
+            units,
+        }) => {
             if args.explain {
-                let matched = describe_match(kind.rule_kind(), &matched);
-                match approval {
-                    Some(scope) => {
-                        let scope = match scope {
-                            ApprovalScope::Once => "once",
-                            ApprovalScope::Session => "session",
-                        };
-                        eprintln!(
-                            "ALLOW {} ({matched}, approval='{scope}')",
-                            shlex_join(&command)
-                        );
-                    }
-                    None => eprintln!("ALLOW {} ({matched})", shlex_join(&command)),
-                }
+                print_shell_authorization(&command, aggregate_kind, &units, true);
             }
         }
     }
@@ -192,6 +219,40 @@ fn run() -> i32 {
     } else {
         eprintln!("saferun: failed to exec {}: {error}", command[0]);
         126
+    }
+}
+
+fn print_shell_authorization(
+    command: &[String],
+    aggregate_kind: saferun::authorization::AuthorizationKind,
+    units: &[ShellUnitAuthorization<'_>],
+    stderr: bool,
+) {
+    for (index, unit) in units.iter().enumerate() {
+        let line = format!(
+            "PART {}/{} {} {} ({})",
+            index + 1,
+            units.len(),
+            unit.kind.label(),
+            unit.unit.display_command(),
+            describe_match(unit.kind.rule_kind(), &unit.matched)
+        );
+        if stderr {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+    }
+    let line = format!(
+        "{} {} (shell_parts={})",
+        aggregate_kind.label(),
+        shlex_join(command),
+        units.len()
+    );
+    if stderr {
+        eprintln!("{line}");
+    } else {
+        println!("{line}");
     }
 }
 

@@ -87,6 +87,7 @@ pub enum PolicyDecision<'a> {
 #[derive(Debug)]
 pub struct Policy {
     prefixes: Vec<Rule>,
+    shell_prefixes: Vec<Rule>,
     ask: Vec<Rule>,
     allow: Vec<Rule>,
     deny: Vec<Rule>,
@@ -98,6 +99,14 @@ impl Policy {
     pub fn digest(&self) -> [u8; 32] {
         self.digest
     }
+
+    pub fn implicit_ask_match(&self) -> RuleMatch<'_> {
+        RuleMatch {
+            rule: &self.implicit_ask,
+            prefix: None,
+            prefix_parts_consumed: 0,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -105,11 +114,33 @@ impl Policy {
 struct SaferunConfig {
     #[serde(default)]
     prefixes: Vec<String>,
+    #[serde(default)]
+    shell_prefixes: Vec<String>,
     allow: Vec<String>,
     #[serde(default)]
     ask: Vec<String>,
     #[serde(default)]
     deny: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ShellPrefixMatch<'a> {
+    rule: &'a Rule,
+    parts_consumed: usize,
+}
+
+impl<'a> ShellPrefixMatch<'a> {
+    pub fn rule(&self) -> &'a Rule {
+        self.rule
+    }
+
+    pub fn rule_source(&self) -> &'a str {
+        self.rule.source()
+    }
+
+    pub fn parts_consumed(&self) -> usize {
+        self.parts_consumed
+    }
 }
 
 /// Parse a rule source string into a compiled `Rule`.
@@ -233,7 +264,13 @@ fn parse_policy(text: &str, digest: [u8; 32]) -> Result<Policy, ConfigError> {
             "allow must contain at least one entry".to_string(),
         ));
     }
-    for entries in [&config.prefixes, &config.ask, &config.allow, &config.deny] {
+    for entries in [
+        &config.prefixes,
+        &config.shell_prefixes,
+        &config.ask,
+        &config.allow,
+        &config.deny,
+    ] {
         for entry in entries {
             if entry.trim().is_empty() {
                 return Err(ConfigError("entries must not be empty".to_string()));
@@ -245,6 +282,11 @@ fn parse_policy(text: &str, digest: [u8; 32]) -> Result<Policy, ConfigError> {
         .prefixes
         .iter()
         .map(|value| parse_rule("prefix", value))
+        .collect::<Result<Vec<_>, _>>()?;
+    let shell_prefixes = config
+        .shell_prefixes
+        .iter()
+        .map(|value| parse_rule("shell_prefix", value))
         .collect::<Result<Vec<_>, _>>()?;
     let ask = config
         .ask
@@ -264,6 +306,7 @@ fn parse_policy(text: &str, digest: [u8; 32]) -> Result<Policy, ConfigError> {
 
     Ok(Policy {
         prefixes,
+        shell_prefixes,
         ask,
         allow,
         deny,
@@ -370,6 +413,20 @@ fn find_deny_match(prefixes: &[Rule], denied: &[Rule], argv: &[String]) -> bool 
     }
 
     false
+}
+
+pub fn is_denied(policy: &Policy, argv: &[String]) -> bool {
+    find_deny_match(&policy.prefixes, &policy.deny, argv)
+}
+
+pub fn shell_prefix_matches<'a>(policy: &'a Policy, argv: &[String]) -> Vec<ShellPrefixMatch<'a>> {
+    prefix_matches(&policy.shell_prefixes, argv)
+        .into_iter()
+        .map(|(rule, parts_consumed)| ShellPrefixMatch {
+            rule,
+            parts_consumed,
+        })
+        .collect()
 }
 
 /// Classify with precedence `deny > ask > allow > implicit ask`.
@@ -581,6 +638,22 @@ mod tests {
         assert!(unprefixed.is_implicit());
         assert_eq!(unprefixed.prefix_rule_source(), None);
         assert_eq!(unprefixed.prefix_parts_consumed(), 0);
+    }
+
+    #[test]
+    fn shell_prefixes_do_not_behave_like_generic_prefixes() {
+        let parsed = policy("shell_prefixes:\n  - bash -c\nallow:\n  - cargo test\n");
+        let command = argv(&["bash", "-c", "cargo test"]);
+        let PolicyDecision::Ask(matched) = classify(&parsed, &command) else {
+            panic!("shell prefix must not affect direct classification");
+        };
+        assert!(matched.is_implicit());
+        assert_eq!(matched.prefix_rule_source(), None);
+
+        let shell_matches = shell_prefix_matches(&parsed, &command);
+        assert_eq!(shell_matches.len(), 1);
+        assert_eq!(shell_matches[0].rule_source(), "bash -c");
+        assert_eq!(shell_matches[0].parts_consumed(), 2);
     }
 
     #[test]

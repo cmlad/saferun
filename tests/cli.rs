@@ -156,3 +156,81 @@ fn unmatched_dry_run_defaults_to_ask() {
     assert_eq!(output.stdout, b"ASK /bin/false (ask='<no matched rule>')\n");
     assert!(output.stderr.is_empty(), "{output:?}");
 }
+
+#[test]
+fn shell_dry_run_prints_parts_and_aggregate_decision() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = temp.path().join("saferun.yaml");
+    std::fs::write(
+        &config,
+        "shell_prefixes: ['bash -c']\nallow:\n  - cargo test\nask:\n  - git push **\n",
+    )
+    .expect("write config");
+    let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
+        .args(["--config"])
+        .arg(&config)
+        .args([
+            "--dry-run",
+            "--",
+            "bash",
+            "-c",
+            "cargo test; git push origin main",
+        ])
+        .output()
+        .expect("run saferun");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"PART 1/2 ALLOW cargo test (allow='cargo test')\n\
+          PART 2/2 ASK git push origin main (ask='git push **')\n\
+          ASK bash -c 'cargo test; git push origin main' (shell_parts=2)\n"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
+fn nested_shell_dry_run_is_denied_with_diagnostic() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = temp.path().join("saferun.yaml");
+    std::fs::write(
+        &config,
+        "shell_prefixes: ['bash -c']\nallow:\n  - git status\nask:\n  - '**'\n",
+    )
+    .expect("write config");
+    let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
+        .args(["--config"])
+        .arg(&config)
+        .args(["--dry-run", "--", "bash", "-c", "bash -c 'git status'"])
+        .output()
+        .expect("run saferun");
+
+    assert_eq!(output.status.code(), Some(126));
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "saferun: nested shell invocation is not permitted: bash -c 'git status'\n\
+         DENIED bash -c 'bash -c '\"'\"'git status'\"'\"''\n"
+    );
+}
+
+#[test]
+fn shell_invocation_executes_original_command_after_parts_are_allowed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = temp.path().join("saferun.yaml");
+    std::fs::write(
+        &config,
+        "shell_prefixes: ['/bin/bash -c']\nallow:\n  - printf ok\n  - printf done\n",
+    )
+    .expect("write config");
+    let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
+        .args(["--config"])
+        .arg(&config)
+        .args(["--", "/bin/bash", "-c", "printf ok; printf done"])
+        .output()
+        .expect("run saferun");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"okdone");
+    assert!(output.stderr.is_empty(), "{output:?}");
+}

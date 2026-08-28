@@ -7,7 +7,8 @@ use crate::approval::{
     lowercase_hex, session_digest, ApprovalClient, ApprovalDecision, ApprovalRequest,
     ApprovalScope, PROTOCOL_VERSION,
 };
-use crate::policy::{classify, Policy, PolicyDecision, RuleMatch};
+use crate::policy::{classify, is_denied, shell_prefix_matches, Policy, PolicyDecision, RuleMatch};
+use crate::shell::{analyze_shell_invocation, ShellCommandUnit, ShellInvocation};
 
 pub const DENIED_EXIT_CODE: i32 = 126;
 
@@ -49,12 +50,52 @@ pub enum AuthorizationOutcome<'a> {
     },
 }
 
+#[derive(Debug)]
+pub struct ShellUnitAuthorization<'a> {
+    pub unit: ShellCommandUnit,
+    pub kind: AuthorizationKind,
+    pub matched: RuleMatch<'a>,
+    pub approval: Option<ApprovalScope>,
+}
+
+#[derive(Debug)]
+pub enum ShellAuthorizationOutcome<'a> {
+    Denied {
+        diagnostic: Option<String>,
+    },
+    DryRun {
+        aggregate_kind: AuthorizationKind,
+        units: Vec<ShellUnitAuthorization<'a>>,
+    },
+    Execute {
+        aggregate_kind: AuthorizationKind,
+        units: Vec<ShellUnitAuthorization<'a>>,
+    },
+}
+
+#[derive(Debug)]
+pub enum InvocationAuthorizationOutcome<'a> {
+    Direct(AuthorizationOutcome<'a>),
+    Shell(ShellAuthorizationOutcome<'a>),
+}
+
 impl AuthorizationOutcome<'_> {
     pub fn exit_code(&self) -> Option<i32> {
         match self {
             Self::Denied { .. } => Some(DENIED_EXIT_CODE),
             Self::DryRun { .. } => Some(0),
             Self::Execute { .. } => None,
+        }
+    }
+}
+
+impl InvocationAuthorizationOutcome<'_> {
+    pub fn exit_code(&self) -> Option<i32> {
+        match self {
+            Self::Direct(outcome) => outcome.exit_code(),
+            Self::Shell(ShellAuthorizationOutcome::Denied { .. }) => Some(DENIED_EXIT_CODE),
+            Self::Shell(ShellAuthorizationOutcome::DryRun { .. }) => Some(0),
+            Self::Shell(ShellAuthorizationOutcome::Execute { .. }) => None,
         }
     }
 }
@@ -84,68 +125,236 @@ pub fn authorize_command<'a>(
             matched,
         },
         PolicyDecision::Ask(matched) => {
-            let Some(token) = token else {
-                return AuthorizationOutcome::Denied {
-                    diagnostic: Some(
-                        "saferun: ask command requires SAFERUN_TOKEN_FILE".to_string(),
-                    ),
-                };
-            };
-
-            let cwd = match env::current_dir().and_then(fs::canonicalize) {
-                Ok(path) => path,
-                Err(error) => {
-                    return service_failure(format!(
-                        "cannot canonicalize current directory: {error}"
-                    ));
-                }
-            };
-            let canonical_config = match fs::canonicalize(config_path) {
-                Ok(path) => path,
-                Err(error) => {
-                    return service_failure(format!("cannot canonicalize config path: {error}"));
-                }
-            };
-            let prefix_parts_consumed = match u32::try_from(matched.prefix_parts_consumed()) {
-                Ok(count) => count,
-                Err(_) => return service_failure("matched prefix count is too large".to_string()),
-            };
-            let request = ApprovalRequest {
-                version: PROTOCOL_VERSION,
-                session_digest: session_digest(token),
-                command: command.to_vec(),
-                cwd: cwd.as_os_str().as_bytes().to_vec(),
-                config_path: canonical_config.as_os_str().as_bytes().to_vec(),
-                policy_digest: lowercase_hex(&policy.digest()),
-                ask_rule_source: matched.rule_source().to_string(),
-                implicit_ask: matched.is_implicit(),
-                prefix_rule_source: matched.prefix_rule_source().map(str::to_string),
-                prefix_parts_consumed,
-            };
-
-            match client.request(&request) {
-                Ok(ApprovalDecision::Denied) => AuthorizationOutcome::Denied { diagnostic: None },
-                Ok(ApprovalDecision::Approved { scope }) => AuthorizationOutcome::Execute {
+            match request_approval(policy, command, config_path, token, matched, client) {
+                Ok(scope) => AuthorizationOutcome::Execute {
                     kind: AuthorizationKind::Ask,
                     matched,
                     approval: Some(scope),
                 },
-                Err(error) => service_failure(error.to_string()),
+                Err(diagnostic) => AuthorizationOutcome::Denied { diagnostic },
             }
         }
     }
 }
 
-fn service_failure(message: String) -> AuthorizationOutcome<'static> {
-    AuthorizationOutcome::Denied {
-        diagnostic: Some(format!("saferun: approval service error: {message}")),
+pub fn authorize_invocation<'a>(
+    policy: &'a Policy,
+    command: &[String],
+    config_path: &Path,
+    dry_run: bool,
+    token: Option<&[u8; 32]>,
+    client: &dyn ApprovalClient,
+) -> InvocationAuthorizationOutcome<'a> {
+    let Some(shell_invocation) = analyze_shell_invocation(policy, command) else {
+        return InvocationAuthorizationOutcome::Direct(authorize_command(
+            policy,
+            command,
+            config_path,
+            dry_run,
+            token,
+            client,
+        ));
+    };
+
+    InvocationAuthorizationOutcome::Shell(authorize_shell_invocation(
+        policy,
+        command,
+        shell_invocation,
+        config_path,
+        dry_run,
+        token,
+        client,
+    ))
+}
+
+fn authorize_shell_invocation<'a>(
+    policy: &'a Policy,
+    original_command: &[String],
+    shell_invocation: ShellInvocation,
+    config_path: &Path,
+    dry_run: bool,
+    token: Option<&[u8; 32]>,
+    client: &dyn ApprovalClient,
+) -> ShellAuthorizationOutcome<'a> {
+    if is_denied(policy, original_command)
+        || shell_invocation
+            .static_commands
+            .iter()
+            .any(|argv| denied(policy, argv))
+    {
+        return ShellAuthorizationOutcome::Denied { diagnostic: None };
     }
+
+    if let Some(nested) = shell_invocation
+        .static_commands
+        .iter()
+        .find_map(|argv| nested_shell_command(policy, argv))
+    {
+        return ShellAuthorizationOutcome::Denied {
+            diagnostic: Some(format!(
+                "saferun: nested shell invocation is not permitted: {}",
+                crate::policy::shlex_join(&nested)
+            )),
+        };
+    }
+
+    let mut classified = Vec::with_capacity(shell_invocation.units.len());
+    let mut aggregate_kind = AuthorizationKind::Allow;
+    for unit in shell_invocation.units {
+        match classify_unit(policy, unit) {
+            Ok(unit) => {
+                if unit.kind == AuthorizationKind::Ask {
+                    aggregate_kind = AuthorizationKind::Ask;
+                }
+                classified.push(unit);
+            }
+            Err(()) => return ShellAuthorizationOutcome::Denied { diagnostic: None },
+        }
+    }
+
+    if dry_run {
+        return ShellAuthorizationOutcome::DryRun {
+            aggregate_kind,
+            units: classified,
+        };
+    }
+
+    let mut authorized = Vec::with_capacity(classified.len());
+    for mut unit in classified {
+        if unit.kind == AuthorizationKind::Ask {
+            let approval_command = unit.unit.approval_command();
+            match request_approval(
+                policy,
+                &approval_command,
+                config_path,
+                token,
+                unit.matched,
+                client,
+            ) {
+                Ok(scope) => unit.approval = Some(scope),
+                Err(diagnostic) => return ShellAuthorizationOutcome::Denied { diagnostic },
+            }
+        }
+        authorized.push(unit);
+    }
+
+    ShellAuthorizationOutcome::Execute {
+        aggregate_kind,
+        units: authorized,
+    }
+}
+
+fn classify_unit<'a>(
+    policy: &'a Policy,
+    unit: ShellCommandUnit,
+) -> Result<ShellUnitAuthorization<'a>, ()> {
+    let (kind, matched) = match &unit {
+        ShellCommandUnit::Parsed(argv) => match classify(policy, argv) {
+            PolicyDecision::Deny => return Err(()),
+            PolicyDecision::Ask(matched) => (AuthorizationKind::Ask, matched),
+            PolicyDecision::Allow(matched) => (AuthorizationKind::Allow, matched),
+        },
+        ShellCommandUnit::Opaque(_) => (AuthorizationKind::Ask, policy.implicit_ask_match()),
+    };
+
+    Ok(ShellUnitAuthorization {
+        unit,
+        kind,
+        matched,
+        approval: None,
+    })
+}
+
+fn denied(policy: &Policy, argv: &[String]) -> bool {
+    is_denied(policy, argv)
+        || strip_leading_assignments(argv).is_some_and(|effective| is_denied(policy, effective))
+}
+
+fn nested_shell_command(policy: &Policy, argv: &[String]) -> Option<Vec<String>> {
+    if !shell_prefix_matches(policy, argv).is_empty() {
+        return Some(argv.to_vec());
+    }
+    let effective = strip_leading_assignments(argv)?;
+    if !shell_prefix_matches(policy, effective).is_empty() {
+        return Some(effective.to_vec());
+    }
+    None
+}
+
+fn strip_leading_assignments(argv: &[String]) -> Option<&[String]> {
+    let first_command = argv.iter().position(|part| !is_assignment(part))?;
+    if first_command == 0 {
+        None
+    } else {
+        Some(&argv[first_command..])
+    }
+}
+
+fn is_assignment(value: &str) -> bool {
+    let Some((key, _)) = value.split_once('=') else {
+        return false;
+    };
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn request_approval(
+    policy: &Policy,
+    command: &[String],
+    config_path: &Path,
+    token: Option<&[u8; 32]>,
+    matched: RuleMatch<'_>,
+    client: &dyn ApprovalClient,
+) -> Result<ApprovalScope, Option<String>> {
+    let Some(token) = token else {
+        return Err(Some(
+            "saferun: ask command requires SAFERUN_TOKEN_FILE".to_string(),
+        ));
+    };
+
+    let cwd = env::current_dir()
+        .and_then(fs::canonicalize)
+        .map_err(|error| {
+            service_failure(format!("cannot canonicalize current directory: {error}"))
+        })?;
+    let canonical_config = fs::canonicalize(config_path)
+        .map_err(|error| service_failure(format!("cannot canonicalize config path: {error}")))?;
+    let prefix_parts_consumed = u32::try_from(matched.prefix_parts_consumed())
+        .map_err(|_| service_failure("matched prefix count is too large".to_string()))?;
+    let request = ApprovalRequest {
+        version: PROTOCOL_VERSION,
+        session_digest: session_digest(token),
+        command: command.to_vec(),
+        cwd: cwd.as_os_str().as_bytes().to_vec(),
+        config_path: canonical_config.as_os_str().as_bytes().to_vec(),
+        policy_digest: lowercase_hex(&policy.digest()),
+        ask_rule_source: matched.rule_source().to_string(),
+        implicit_ask: matched.is_implicit(),
+        prefix_rule_source: matched.prefix_rule_source().map(str::to_string),
+        prefix_parts_consumed,
+    };
+
+    match client.request(&request) {
+        Ok(ApprovalDecision::Denied) => Err(None),
+        Ok(ApprovalDecision::Approved { scope }) => Ok(scope),
+        Err(error) => Err(service_failure(error.to_string())),
+    }
+}
+
+fn service_failure(message: String) -> Option<String> {
+    Some(format!("saferun: approval service error: {message}"))
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::collections::VecDeque;
     use std::io;
+    use std::path::PathBuf;
 
     use super::*;
     use crate::approval::{ApprovalError, ApprovalScope};
@@ -167,12 +376,58 @@ mod tests {
         }
     }
 
+    struct QueueClient {
+        calls: Cell<usize>,
+        requests: std::cell::RefCell<Vec<ApprovalRequest>>,
+        results: std::cell::RefCell<VecDeque<Result<ApprovalDecision, &'static str>>>,
+    }
+
+    impl QueueClient {
+        fn new(results: impl IntoIterator<Item = Result<ApprovalDecision, &'static str>>) -> Self {
+            Self {
+                calls: Cell::new(0),
+                requests: std::cell::RefCell::new(Vec::new()),
+                results: std::cell::RefCell::new(results.into_iter().collect()),
+            }
+        }
+    }
+
+    impl ApprovalClient for QueueClient {
+        fn request(&self, request: &ApprovalRequest) -> Result<ApprovalDecision, ApprovalError> {
+            self.calls.set(self.calls.get() + 1);
+            self.requests.borrow_mut().push(request.clone());
+            self.results
+                .borrow_mut()
+                .pop_front()
+                .expect("queued approval result")
+                .map_err(|message| {
+                    ApprovalError::Io(io::Error::new(io::ErrorKind::ConnectionRefused, message))
+                })
+        }
+    }
+
     fn ask_policy() -> (tempfile::TempDir, Policy) {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("saferun.yaml");
         std::fs::write(&path, "allow: [/bin/true]\nask: [/usr/bin/touch]\n").expect("write policy");
         let policy = load_policy(&path).expect("load policy");
         (directory, policy)
+    }
+
+    fn policy(text: &str) -> (tempfile::TempDir, PathBuf, Policy) {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("saferun.yaml");
+        std::fs::write(&path, text).expect("write policy");
+        let policy = load_policy(&path).expect("load policy");
+        (directory, path, policy)
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_string()).collect()
+    }
+
+    fn approved(scope: ApprovalScope) -> Result<ApprovalDecision, &'static str> {
+        Ok(ApprovalDecision::Approved { scope })
     }
 
     #[test]
@@ -332,5 +587,151 @@ mod tests {
         assert!(request.implicit_ask);
         assert_eq!(request.prefix_rule_source.as_deref(), Some("env *"));
         assert_eq!(request.prefix_parts_consumed, 2);
+    }
+
+    #[test]
+    fn shell_all_allowed_payload_does_not_prompt() {
+        let (_directory, config, policy) = policy(
+            "shell_prefixes: ['bash -c']\nallow:\n  - cargo test\n  - git status\nask:\n  - git push **\n",
+        );
+        let client = QueueClient::new([Err("must not be called")]);
+        let command = argv(&["bash", "-c", "cargo test && git status"]);
+        let outcome = authorize_invocation(&policy, &command, &config, false, None, &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Execute {
+            aggregate_kind,
+            units,
+        }) = outcome
+        else {
+            panic!("expected shell execution");
+        };
+        assert_eq!(aggregate_kind, AuthorizationKind::Allow);
+        assert_eq!(units.len(), 2);
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn shell_mixed_allow_and_ask_prompts_for_asks_in_order() {
+        let (_directory, config, policy) = policy(
+            "shell_prefixes: ['bash -c']\nallow:\n  - cargo test\nask:\n  - git push **\n  - gh pr create **\n",
+        );
+        let client = QueueClient::new([
+            approved(ApprovalScope::Once),
+            approved(ApprovalScope::Session),
+        ]);
+        let command = argv(&[
+            "bash",
+            "-c",
+            "cargo test; git push origin main; gh pr create --fill",
+        ]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[4; 32]), &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Execute {
+            aggregate_kind,
+            units,
+        }) = outcome
+        else {
+            panic!("expected shell execution");
+        };
+        assert_eq!(aggregate_kind, AuthorizationKind::Ask);
+        assert_eq!(units.len(), 3);
+        assert_eq!(client.calls.get(), 2);
+        let requests = client.requests.borrow();
+        assert_eq!(
+            requests[0].command,
+            argv(&["git", "push", "origin", "main"])
+        );
+        assert_eq!(requests[1].command, argv(&["gh", "pr", "create", "--fill"]));
+    }
+
+    #[test]
+    fn shell_denial_is_detected_before_prompting() {
+        let (_directory, config, policy) = policy(
+            "shell_prefixes: ['bash -c']\nallow: [cargo test]\nask: ['git push **']\ndeny: ['rm **']\n",
+        );
+        let client = QueueClient::new([approved(ApprovalScope::Once)]);
+        let command = argv(&["bash", "-c", "git push origin main; rm target"]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[5; 32]), &client);
+
+        assert!(matches!(
+            outcome,
+            InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
+                diagnostic: None
+            })
+        ));
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn shell_rejection_stops_later_approvals() {
+        let (_directory, config, policy) =
+            policy("shell_prefixes: ['bash -c']\nallow: [/bin/true]\nask: ['git push **']\n");
+        let client =
+            QueueClient::new([approved(ApprovalScope::Once), Ok(ApprovalDecision::Denied)]);
+        let command = argv(&[
+            "bash",
+            "-c",
+            "git push origin main; git push origin release; git push origin dev",
+        ]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[6; 32]), &client);
+
+        assert!(matches!(
+            outcome,
+            InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
+                diagnostic: None
+            })
+        ));
+        assert_eq!(client.calls.get(), 2);
+    }
+
+    #[test]
+    fn shell_opaque_unit_forces_exact_implicit_approval() {
+        let (_directory, config, policy) =
+            policy("shell_prefixes: ['bash -c']\nallow:\n  - echo **\nask:\n  - echo **\n");
+        let client = QueueClient::new([approved(ApprovalScope::Session)]);
+        let command = argv(&["bash", "-c", "echo hi > file"]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[7; 32]), &client);
+
+        assert!(matches!(
+            outcome,
+            InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Execute {
+                aggregate_kind: AuthorizationKind::Ask,
+                ..
+            })
+        ));
+        assert_eq!(client.calls.get(), 1);
+        let requests = client.requests.borrow();
+        assert_eq!(requests[0].command, vec!["'echo hi > file'".to_string()]);
+        assert!(requests[0].implicit_ask);
+        assert_eq!(
+            requests[0].ask_rule_source,
+            crate::policy::IMPLICIT_ASK_SOURCE
+        );
+    }
+
+    #[test]
+    fn nested_configured_shell_invocation_is_denied() {
+        let (_directory, config, policy) =
+            policy("shell_prefixes: ['bash -c']\nallow:\n  - git status\nask:\n  - '**'\n");
+        let client = QueueClient::new([approved(ApprovalScope::Once)]);
+        let command = argv(&["bash", "-c", "git status; bash -c 'git status'"]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[8; 32]), &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
+            diagnostic: Some(message),
+        }) = outcome
+        else {
+            panic!("expected nested shell denial");
+        };
+        assert_eq!(
+            message,
+            "saferun: nested shell invocation is not permitted: bash -c 'git status'"
+        );
+        assert_eq!(client.calls.get(), 0);
     }
 }

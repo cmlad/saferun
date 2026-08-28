@@ -419,6 +419,13 @@ pub fn is_denied(policy: &Policy, argv: &[String]) -> bool {
     find_deny_match(&policy.prefixes, &policy.deny, argv)
 }
 
+pub fn configured_prefix_remainders<'a>(policy: &Policy, argv: &'a [String]) -> Vec<&'a [String]> {
+    prefix_matches(&policy.prefixes, argv)
+        .into_iter()
+        .map(|(_, consumed)| &argv[consumed..])
+        .collect()
+}
+
 pub fn shell_prefix_matches<'a>(policy: &'a Policy, argv: &[String]) -> Vec<ShellPrefixMatch<'a>> {
     prefix_matches(&policy.shell_prefixes, argv)
         .into_iter()

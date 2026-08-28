@@ -97,6 +97,8 @@ fn is_literal_simple_command(segment: &ShellSegment) -> bool {
             .words
             .iter()
             .any(|word| word.is_assignment() || word.is_expansion())
+        && !has_unquoted_brace_expansion(segment.command.as_str())
+        && !has_unquoted_tilde_expansion(segment.command.as_str())
         && !has_unquoted_glob(segment.command.as_str())
         && !has_unquoted_redirection(segment.command.as_str())
 }
@@ -172,6 +174,43 @@ fn has_unquoted_glob(value: &str) -> bool {
 
 fn has_unquoted_redirection(value: &str) -> bool {
     has_unquoted_meta(value, &['<', '>'])
+}
+
+fn has_unquoted_brace_expansion(value: &str) -> bool {
+    has_unquoted_meta(value, &['{', '}'])
+}
+
+fn has_unquoted_tilde_expansion(value: &str) -> bool {
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    let mut word_start = true;
+
+    for character in value.chars() {
+        if escaped {
+            escaped = false;
+            word_start = false;
+            continue;
+        }
+        match character {
+            '\\' if !single_quoted => escaped = true,
+            '\'' if !double_quoted => {
+                single_quoted = !single_quoted;
+                word_start = false;
+            }
+            '"' if !single_quoted => {
+                double_quoted = !double_quoted;
+                word_start = false;
+            }
+            _ if !single_quoted && !double_quoted && character.is_ascii_whitespace() => {
+                word_start = true;
+            }
+            '~' if !single_quoted && !double_quoted && word_start => return true,
+            _ => word_start = false,
+        }
+    }
+
+    false
 }
 
 fn has_unquoted_meta(value: &str, metas: &[char]) -> bool {
@@ -260,6 +299,18 @@ mod tests {
     }
 
     #[test]
+    fn quoted_brace_and_tilde_characters_stay_arguments() {
+        assert_eq!(
+            unit_strings(&["bash", "-c", r#"printf "{a,b}" "~""#]),
+            vec![ShellCommandUnit::Parsed(vec![
+                "printf".into(),
+                "{a,b}".into(),
+                "~".into(),
+            ])]
+        );
+    }
+
+    #[test]
     fn supported_chains_and_pipelines_reconstruct_argv() {
         assert_eq!(
             unit_strings(&["bash", "-c", "printf hi|grep h&&cargo test;"]),
@@ -293,6 +344,9 @@ mod tests {
             "echo hi > file",
             "echo $(date)",
             "echo $HOME",
+            "echo {a,b}",
+            "r{m,} target",
+            "~/bin/tool --version",
             "echo *",
             "cargo test || git status",
             "sleep 1 & git status",

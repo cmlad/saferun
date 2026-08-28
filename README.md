@@ -192,6 +192,8 @@ PART 2/2 ASK git push origin main (ask='git push **')
 ASK /bin/zsh -lc 'cargo test; git push origin main' (shell_parts=2)
 ```
 
+In a live `--explain` run, approved ask parts are reported as `ALLOW` with `approval='once'` or `approval='session'`, and the aggregate shell invocation is reported as `ALLOW` before execution.
+
 The panel title is `saferun in <directory>`. Its body lists each argv item on a numbered, unquoted, reversible byte-safe line: `Prefix N` for a recognized configured prefix and `Command N` for the effective command. Rule metadata and the eight-character session fingerprint follow. Control characters, invalid UTF-8, and bidi controls are escaped. The scope dropdown sits beside `Allow for session`.
 
 ## Build

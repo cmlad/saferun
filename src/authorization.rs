@@ -7,7 +7,10 @@ use crate::approval::{
     lowercase_hex, session_digest, ApprovalClient, ApprovalDecision, ApprovalRequest,
     ApprovalScope, PROTOCOL_VERSION,
 };
-use crate::policy::{classify, is_denied, shell_prefix_matches, Policy, PolicyDecision, RuleMatch};
+use crate::policy::{
+    classify, configured_prefix_remainders, is_denied, shell_prefix_matches, Policy,
+    PolicyDecision, RuleMatch,
+};
 use crate::shell::{analyze_shell_invocation, ShellCommandUnit, ShellInvocation};
 
 pub const DENIED_EXIT_CODE: i32 = 126;
@@ -271,14 +274,32 @@ fn denied(policy: &Policy, argv: &[String]) -> bool {
 }
 
 fn nested_shell_command(policy: &Policy, argv: &[String]) -> Option<Vec<String>> {
-    if !shell_prefix_matches(policy, argv).is_empty() {
-        return Some(argv.to_vec());
-    }
-    let effective = strip_leading_assignments(argv)?;
-    if !shell_prefix_matches(policy, effective).is_empty() {
-        return Some(effective.to_vec());
+    for candidate in shell_prefix_candidates(policy, argv) {
+        if !shell_prefix_matches(policy, candidate).is_empty() {
+            return Some(candidate.to_vec());
+        }
     }
     None
+}
+
+fn shell_prefix_candidates<'a>(policy: &Policy, argv: &'a [String]) -> Vec<&'a [String]> {
+    let mut candidates = Vec::new();
+    push_shell_prefix_candidate(&mut candidates, argv);
+
+    for base in candidates.clone() {
+        for remainder in configured_prefix_remainders(policy, base) {
+            push_shell_prefix_candidate(&mut candidates, remainder);
+        }
+    }
+
+    candidates
+}
+
+fn push_shell_prefix_candidate<'a>(candidates: &mut Vec<&'a [String]>, candidate: &'a [String]) {
+    candidates.push(candidate);
+    if let Some(effective) = strip_leading_assignments(candidate) {
+        candidates.push(effective);
+    }
 }
 
 fn strip_leading_assignments(argv: &[String]) -> Option<&[String]> {
@@ -665,6 +686,57 @@ mod tests {
     }
 
     #[test]
+    fn shell_command_position_brace_expansion_cannot_use_literal_allow_to_bypass_deny() {
+        let (_directory, config, policy) =
+            policy("shell_prefixes: ['bash -c']\nallow:\n  - r{m,} target\ndeny:\n  - rm **\n");
+        let client = QueueClient::new([Err("must not be called")]);
+        let command = argv(&["bash", "-c", "r{m,} target"]);
+        let outcome = authorize_invocation(&policy, &command, &config, true, None, &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::DryRun {
+            aggregate_kind,
+            units,
+        }) = outcome
+        else {
+            panic!("expected shell dry-run");
+        };
+        assert_eq!(aggregate_kind, AuthorizationKind::Ask);
+        assert_eq!(units.len(), 1);
+        assert_eq!(
+            units[0].unit,
+            ShellCommandUnit::Opaque("'r{m,} target'".into())
+        );
+        assert!(units[0].matched.is_implicit());
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn shell_command_position_tilde_expansion_cannot_use_literal_allow_to_bypass_deny() {
+        let (_directory, config, policy) = policy(
+            "shell_prefixes: ['bash -c']\nallow:\n  - ~/bin/danger target\ndeny:\n  - /expanded/home/bin/danger **\n",
+        );
+        let client = QueueClient::new([Err("must not be called")]);
+        let command = argv(&["bash", "-c", "~/bin/danger target"]);
+        let outcome = authorize_invocation(&policy, &command, &config, true, None, &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::DryRun {
+            aggregate_kind,
+            units,
+        }) = outcome
+        else {
+            panic!("expected shell dry-run");
+        };
+        assert_eq!(aggregate_kind, AuthorizationKind::Ask);
+        assert_eq!(units.len(), 1);
+        assert_eq!(
+            units[0].unit,
+            ShellCommandUnit::Opaque("'~/bin/danger target'".into())
+        );
+        assert!(units[0].matched.is_implicit());
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
     fn shell_rejection_stops_later_approvals() {
         let (_directory, config, policy) =
             policy("shell_prefixes: ['bash -c']\nallow: [/bin/true]\nask: ['git push **']\n");
@@ -721,6 +793,29 @@ mod tests {
         let command = argv(&["bash", "-c", "git status; bash -c 'git status'"]);
         let outcome =
             authorize_invocation(&policy, &command, &config, false, Some(&[8; 32]), &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
+            diagnostic: Some(message),
+        }) = outcome
+        else {
+            panic!("expected nested shell denial");
+        };
+        assert_eq!(
+            message,
+            "saferun: nested shell invocation is not permitted: bash -c 'git status'"
+        );
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn nested_configured_shell_invocation_after_generic_prefix_is_denied() {
+        let (_directory, config, policy) = policy(
+            "prefixes: ['env *']\nshell_prefixes: ['bash -c']\nallow:\n  - git status\nask:\n  - '**'\n",
+        );
+        let client = QueueClient::new([approved(ApprovalScope::Once)]);
+        let command = argv(&["bash", "-c", "env X=1 bash -c 'git status'"]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[9; 32]), &client);
 
         let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
             diagnostic: Some(message),

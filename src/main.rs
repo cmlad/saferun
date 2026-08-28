@@ -13,7 +13,7 @@ use saferun::approval::{
     SESSION_TOKEN_FILE_ENV,
 };
 use saferun::authorization::{
-    authorize_invocation, AuthorizationOutcome, InvocationAuthorizationOutcome,
+    authorize_invocation, AuthorizationKind, AuthorizationOutcome, InvocationAuthorizationOutcome,
     ShellAuthorizationOutcome, ShellUnitAuthorization, DENIED_EXIT_CODE,
 };
 use saferun::policy::{describe_match, load_policy, shlex_join, ConfigError};
@@ -174,10 +174,7 @@ fn run() -> i32 {
                     let matched = describe_match(kind.rule_kind(), &matched);
                     match approval {
                         Some(scope) => {
-                            let scope = match scope {
-                                ApprovalScope::Once => "once",
-                                ApprovalScope::Session => "session",
-                            };
+                            let scope = approval_scope_label(scope);
                             eprintln!(
                                 "ALLOW {} ({matched}, approval='{scope}')",
                                 shlex_join(&command)
@@ -199,7 +196,7 @@ fn run() -> i32 {
             aggregate_kind,
             units,
         }) => {
-            print_shell_authorization(&command, aggregate_kind, &units, false);
+            print_shell_authorization(&command, aggregate_kind, &units, false, false);
             return 0;
         }
         InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Execute {
@@ -207,7 +204,7 @@ fn run() -> i32 {
             units,
         }) => {
             if args.explain {
-                print_shell_authorization(&command, aggregate_kind, &units, true);
+                print_shell_authorization(&command, aggregate_kind, &units, true, true);
             }
         }
     }
@@ -224,35 +221,135 @@ fn run() -> i32 {
 
 fn print_shell_authorization(
     command: &[String],
-    aggregate_kind: saferun::authorization::AuthorizationKind,
+    aggregate_kind: AuthorizationKind,
     units: &[ShellUnitAuthorization<'_>],
     stderr: bool,
+    execution_approved: bool,
 ) {
-    for (index, unit) in units.iter().enumerate() {
-        let line = format!(
-            "PART {}/{} {} {} ({})",
-            index + 1,
-            units.len(),
-            unit.kind.label(),
-            unit.unit.display_command(),
-            describe_match(unit.kind.rule_kind(), &unit.matched)
-        );
+    for line in shell_authorization_lines(command, aggregate_kind, units, execution_approved) {
         if stderr {
             eprintln!("{line}");
         } else {
             println!("{line}");
         }
     }
-    let line = format!(
+}
+
+fn shell_authorization_lines(
+    command: &[String],
+    aggregate_kind: AuthorizationKind,
+    units: &[ShellUnitAuthorization<'_>],
+    execution_approved: bool,
+) -> Vec<String> {
+    let mut lines = Vec::with_capacity(units.len() + 1);
+    for (index, unit) in units.iter().enumerate() {
+        let mut matched = describe_match(unit.kind.rule_kind(), &unit.matched);
+        if execution_approved {
+            if let Some(scope) = unit.approval {
+                matched.push_str(&format!(", approval='{}'", approval_scope_label(scope)));
+            }
+        }
+        let label = if execution_approved {
+            AuthorizationKind::Allow.label()
+        } else {
+            unit.kind.label()
+        };
+        lines.push(format!(
+            "PART {}/{} {} {} ({})",
+            index + 1,
+            units.len(),
+            label,
+            unit.unit.display_command(),
+            matched
+        ));
+    }
+
+    let aggregate_label = if execution_approved {
+        AuthorizationKind::Allow.label()
+    } else {
+        aggregate_kind.label()
+    };
+    lines.push(format!(
         "{} {} (shell_parts={})",
-        aggregate_kind.label(),
+        aggregate_label,
         shlex_join(command),
         units.len()
-    );
-    if stderr {
-        eprintln!("{line}");
-    } else {
-        println!("{line}");
+    ));
+    lines
+}
+
+fn approval_scope_label(scope: ApprovalScope) -> &'static str {
+    match scope {
+        ApprovalScope::Once => "once",
+        ApprovalScope::Session => "session",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+    use saferun::approval::{ApprovalClient, ApprovalDecision, ApprovalError, ApprovalRequest};
+
+    struct ApprovingClient {
+        calls: Cell<usize>,
+    }
+
+    impl ApprovalClient for ApprovingClient {
+        fn request(&self, _request: &ApprovalRequest) -> Result<ApprovalDecision, ApprovalError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(ApprovalDecision::Approved {
+                scope: ApprovalScope::Session,
+            })
+        }
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_string()).collect()
+    }
+
+    #[test]
+    fn live_shell_explain_lines_include_approved_ask_scope() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let config = directory.path().join("saferun.yaml");
+        std::fs::write(
+            &config,
+            "shell_prefixes: ['bash -c']\nallow:\n  - cargo test\nask:\n  - git push **\n",
+        )
+        .expect("write config");
+        let policy = load_policy(&config).expect("load policy");
+        let client = ApprovingClient {
+            calls: Cell::new(0),
+        };
+        let command = argv(&["bash", "-c", "cargo test; git push origin main"]);
+        let outcome = authorize_invocation(
+            &policy,
+            &command,
+            &config,
+            false,
+            Some(&[1_u8; 32]),
+            &client,
+        );
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Execute {
+            aggregate_kind,
+            units,
+        }) = outcome
+        else {
+            panic!("expected shell execution");
+        };
+
+        assert_eq!(client.calls.get(), 1);
+        assert_eq!(
+            shell_authorization_lines(&command, aggregate_kind, &units, true),
+            vec![
+                "PART 1/2 ALLOW cargo test (allow='cargo test')".to_string(),
+                "PART 2/2 ALLOW git push origin main (ask='git push **', approval='session')"
+                    .to_string(),
+                "ALLOW bash -c 'cargo test; git push origin main' (shell_parts=2)".to_string(),
+            ]
+        );
     }
 }
 

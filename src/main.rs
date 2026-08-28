@@ -185,11 +185,18 @@ fn run() -> i32 {
                 }
             }
         },
-        InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied { diagnostic }) => {
+        InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
+            diagnostic,
+            units,
+        }) => {
             if let Some(message) = diagnostic {
                 eprintln!("{message}");
             }
-            eprintln!("DENIED {}", shlex_join(&command));
+            if units.is_empty() {
+                eprintln!("DENIED {}", shlex_join(&command));
+            } else {
+                print_shell_authorization(&command, AuthorizationKind::Deny, &units, true, false);
+            }
             return DENIED_EXIT_CODE;
         }
         InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::DryRun {

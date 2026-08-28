@@ -7,7 +7,10 @@ use crate::approval::{
     lowercase_hex, session_digest, ApprovalClient, ApprovalDecision, ApprovalRequest,
     ApprovalScope, PROTOCOL_VERSION,
 };
-use crate::policy::{classify, is_denied, shell_prefix_matches, Policy, PolicyDecision, RuleMatch};
+use crate::policy::{
+    classify, deny_match as policy_deny_match, is_denied, shell_prefix_matches, Policy,
+    PolicyDecision, RuleMatch,
+};
 use crate::shell::{
     analyze_shell_invocation, shell_prefix_candidates_for_shell_command, ShellCommandUnit,
     ShellInvocation,
@@ -17,6 +20,7 @@ pub const DENIED_EXIT_CODE: i32 = 126;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthorizationKind {
+    Deny,
     Ask,
     Allow,
 }
@@ -24,6 +28,7 @@ pub enum AuthorizationKind {
 impl AuthorizationKind {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Deny => "DENIED",
             Self::Ask => "ASK",
             Self::Allow => "ALLOW",
         }
@@ -31,6 +36,7 @@ impl AuthorizationKind {
 
     pub fn rule_kind(self) -> &'static str {
         match self {
+            Self::Deny => "deny",
             Self::Ask => "ask",
             Self::Allow => "allow",
         }
@@ -65,6 +71,7 @@ pub struct ShellUnitAuthorization<'a> {
 pub enum ShellAuthorizationOutcome<'a> {
     Denied {
         diagnostic: Option<String>,
+        units: Vec<ShellUnitAuthorization<'a>>,
     },
     DryRun {
         aggregate_kind: AuthorizationKind,
@@ -179,13 +186,23 @@ fn authorize_shell_invocation<'a>(
     token: Option<&[u8; 32]>,
     client: &dyn ApprovalClient,
 ) -> ShellAuthorizationOutcome<'a> {
-    if is_denied(policy, original_command)
+    let mut classified = Vec::with_capacity(shell_invocation.units.len());
+    for unit in shell_invocation.units {
+        classified.push(classify_unit(policy, unit));
+    }
+    let aggregate_kind = aggregate_kind(&classified);
+
+    if aggregate_kind == AuthorizationKind::Deny
+        || is_denied(policy, original_command)
         || shell_invocation
             .static_commands
             .iter()
             .any(|argv| denied(policy, argv))
     {
-        return ShellAuthorizationOutcome::Denied { diagnostic: None };
+        return ShellAuthorizationOutcome::Denied {
+            diagnostic: None,
+            units: classified,
+        };
     }
 
     if let Some(nested) = shell_invocation
@@ -198,21 +215,8 @@ fn authorize_shell_invocation<'a>(
                 "saferun: nested shell invocation is not permitted: {}",
                 crate::policy::shlex_join(&nested)
             )),
+            units: classified,
         };
-    }
-
-    let mut classified = Vec::with_capacity(shell_invocation.units.len());
-    let mut aggregate_kind = AuthorizationKind::Allow;
-    for unit in shell_invocation.units {
-        match classify_unit(policy, unit) {
-            Ok(unit) => {
-                if unit.kind == AuthorizationKind::Ask {
-                    aggregate_kind = AuthorizationKind::Ask;
-                }
-                classified.push(unit);
-            }
-            Err(()) => return ShellAuthorizationOutcome::Denied { diagnostic: None },
-        }
     }
 
     if dry_run {
@@ -235,7 +239,12 @@ fn authorize_shell_invocation<'a>(
                 client,
             ) {
                 Ok(scope) => unit.approval = Some(scope),
-                Err(diagnostic) => return ShellAuthorizationOutcome::Denied { diagnostic },
+                Err(diagnostic) => {
+                    return ShellAuthorizationOutcome::Denied {
+                        diagnostic,
+                        units: Vec::new(),
+                    };
+                }
             }
         }
         authorized.push(unit);
@@ -247,31 +256,54 @@ fn authorize_shell_invocation<'a>(
     }
 }
 
-fn classify_unit<'a>(
-    policy: &'a Policy,
-    unit: ShellCommandUnit,
-) -> Result<ShellUnitAuthorization<'a>, ()> {
+fn aggregate_kind(units: &[ShellUnitAuthorization<'_>]) -> AuthorizationKind {
+    if units
+        .iter()
+        .any(|unit| unit.kind == AuthorizationKind::Deny)
+    {
+        AuthorizationKind::Deny
+    } else if units.iter().any(|unit| unit.kind == AuthorizationKind::Ask) {
+        AuthorizationKind::Ask
+    } else {
+        AuthorizationKind::Allow
+    }
+}
+
+fn classify_unit<'a>(policy: &'a Policy, unit: ShellCommandUnit) -> ShellUnitAuthorization<'a> {
     let (kind, matched) = match &unit {
-        ShellCommandUnit::Parsed(argv) => match classify(policy, argv) {
-            PolicyDecision::Deny => return Err(()),
-            PolicyDecision::Ask(matched) => (AuthorizationKind::Ask, matched),
-            PolicyDecision::Allow(matched) => (AuthorizationKind::Allow, matched),
-        },
+        ShellCommandUnit::Parsed(argv) => {
+            if let Some(matched) = shell_deny_match(policy, argv) {
+                (AuthorizationKind::Deny, matched)
+            } else {
+                match classify(policy, argv) {
+                    PolicyDecision::Deny => (
+                        AuthorizationKind::Deny,
+                        policy_deny_match(policy, argv).expect("denied command has a match"),
+                    ),
+                    PolicyDecision::Ask(matched) => (AuthorizationKind::Ask, matched),
+                    PolicyDecision::Allow(matched) => (AuthorizationKind::Allow, matched),
+                }
+            }
+        }
         ShellCommandUnit::Opaque(_) => (AuthorizationKind::Ask, policy.implicit_ask_match()),
     };
 
-    Ok(ShellUnitAuthorization {
+    ShellUnitAuthorization {
         unit,
         kind,
         matched,
         approval: None,
-    })
+    }
 }
 
 fn denied(policy: &Policy, argv: &[String]) -> bool {
+    shell_deny_match(policy, argv).is_some()
+}
+
+fn shell_deny_match<'a>(policy: &'a Policy, argv: &[String]) -> Option<RuleMatch<'a>> {
     shell_prefix_candidates_for_shell_command(policy, argv)
         .into_iter()
-        .any(|candidate| is_denied(policy, candidate))
+        .find_map(|candidate| policy_deny_match(policy, candidate))
 }
 
 fn nested_shell_command(policy: &Policy, argv: &[String]) -> Option<Vec<String>> {
@@ -686,12 +718,30 @@ mod tests {
         let outcome =
             authorize_invocation(&policy, &command, &config, false, Some(&[5; 32]), &client);
 
-        assert!(matches!(
-            outcome,
-            InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
-                diagnostic: None
-            })
-        ));
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
+            diagnostic: None,
+            units,
+        }) = outcome
+        else {
+            panic!("expected shell denial");
+        };
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].kind, AuthorizationKind::Ask);
+        assert_eq!(
+            units[0].unit,
+            ShellCommandUnit::Parsed(vec![
+                "git".into(),
+                "push".into(),
+                "origin".into(),
+                "main".into()
+            ])
+        );
+        assert_eq!(units[1].kind, AuthorizationKind::Deny);
+        assert_eq!(
+            units[1].unit,
+            ShellCommandUnit::Parsed(vec!["rm".into(), "target".into()])
+        );
+        assert_eq!(units[1].matched.rule_source(), "rm **");
         assert_eq!(client.calls.get(), 0);
     }
 
@@ -714,7 +764,8 @@ mod tests {
         assert!(matches!(
             outcome,
             InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
-                diagnostic: None
+                diagnostic: None,
+                ..
             })
         ));
         assert_eq!(client.calls.get(), 0);
@@ -733,7 +784,8 @@ mod tests {
         assert!(matches!(
             outcome,
             InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
-                diagnostic: None
+                diagnostic: None,
+                ..
             })
         ));
         assert_eq!(client.calls.get(), 0);
@@ -749,12 +801,20 @@ mod tests {
         let outcome =
             authorize_invocation(&policy, &command, &config, false, Some(&[12; 32]), &client);
 
-        assert!(matches!(
-            outcome,
-            InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
-                diagnostic: None
-            })
-        ));
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
+            diagnostic: None,
+            units,
+        }) = outcome
+        else {
+            panic!("expected shell denial");
+        };
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].kind, AuthorizationKind::Ask);
+        assert_eq!(
+            units[0].unit,
+            ShellCommandUnit::Opaque("'command env A=1 B=2 rm target'".into())
+        );
+        assert_eq!(units[1].kind, AuthorizationKind::Ask);
         assert_eq!(client.calls.get(), 0);
     }
 
@@ -912,7 +972,8 @@ mod tests {
         assert!(matches!(
             outcome,
             InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
-                diagnostic: None
+                diagnostic: None,
+                ..
             })
         ));
         assert_eq!(client.calls.get(), 2);
@@ -955,6 +1016,7 @@ mod tests {
 
         let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
             diagnostic: Some(message),
+            ..
         }) = outcome
         else {
             panic!("expected nested shell denial");
@@ -978,6 +1040,7 @@ mod tests {
 
         let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
             diagnostic: Some(message),
+            ..
         }) = outcome
         else {
             panic!("expected nested shell denial");
@@ -1001,6 +1064,7 @@ mod tests {
 
         let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
             diagnostic: Some(message),
+            ..
         }) = outcome
         else {
             panic!("expected nested shell denial");

@@ -225,6 +225,39 @@ fn shell_dry_run_prints_parts_inside_outer_generic_prefix() {
 }
 
 #[test]
+fn shell_dry_run_denial_prints_parts_and_aggregate_decision() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = temp.path().join("saferun.yaml");
+    std::fs::write(
+        &config,
+        "shell_prefixes: ['bash -c']\nallow:\n  - cargo test\nask:\n  - git push **\ndeny:\n  - rm **\n",
+    )
+    .expect("write config");
+    let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
+        .args(["--config"])
+        .arg(&config)
+        .args([
+            "--dry-run",
+            "--",
+            "bash",
+            "-c",
+            "cargo test; rm target; git push origin main",
+        ])
+        .output()
+        .expect("run saferun");
+
+    assert_eq!(output.status.code(), Some(126));
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "PART 1/3 ALLOW cargo test (allow='cargo test')\n\
+         PART 2/3 DENIED rm target (deny='rm **')\n\
+         PART 3/3 ASK git push origin main (ask='git push **')\n\
+         DENIED bash -c 'cargo test; rm target; git push origin main' (shell_parts=3)\n"
+    );
+}
+
+#[test]
 fn nested_shell_dry_run_is_denied_with_diagnostic() {
     let temp = tempfile::tempdir().expect("tempdir");
     let config = temp.path().join("saferun.yaml");
@@ -245,7 +278,8 @@ fn nested_shell_dry_run_is_denied_with_diagnostic() {
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
         "saferun: nested shell invocation is not permitted: bash -c 'git status'\n\
-         DENIED bash -c 'bash -c '\"'\"'git status'\"'\"''\n"
+         PART 1/1 ASK bash -c 'git status' (ask='**')\n\
+         DENIED bash -c 'bash -c '\"'\"'git status'\"'\"'' (shell_parts=1)\n"
     );
 }
 

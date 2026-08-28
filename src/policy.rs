@@ -394,10 +394,18 @@ fn find_rule_match<'a>(
     None
 }
 
-fn find_deny_match(prefixes: &[Rule], denied: &[Rule], argv: &[String]) -> bool {
+fn find_deny_match<'a>(
+    prefixes: &'a [Rule],
+    denied: &'a [Rule],
+    argv: &[String],
+) -> Option<RuleMatch<'a>> {
     for command in denied {
         if rule_matches_command(command, argv) {
-            return true;
+            return Some(RuleMatch {
+                rule: command,
+                prefix: None,
+                prefix_parts_consumed: 0,
+            });
         }
     }
 
@@ -406,16 +414,24 @@ fn find_deny_match(prefixes: &[Rule], denied: &[Rule], argv: &[String]) -> bool 
             let rest = &argv[consumed..];
             for command in denied {
                 if rule_matches_command(command, rest) {
-                    return true;
+                    return Some(RuleMatch {
+                        rule: command,
+                        prefix: Some(prefix),
+                        prefix_parts_consumed: consumed,
+                    });
                 }
             }
         }
     }
 
-    false
+    None
 }
 
 pub fn is_denied(policy: &Policy, argv: &[String]) -> bool {
+    deny_match(policy, argv).is_some()
+}
+
+pub fn deny_match<'a>(policy: &'a Policy, argv: &[String]) -> Option<RuleMatch<'a>> {
     find_deny_match(&policy.prefixes, &policy.deny, argv)
 }
 
@@ -438,7 +454,7 @@ pub fn shell_prefix_matches<'a>(policy: &'a Policy, argv: &[String]) -> Vec<Shel
 
 /// Classify with precedence `deny > ask > allow > implicit ask`.
 pub fn classify<'a>(policy: &'a Policy, argv: &[String]) -> PolicyDecision<'a> {
-    if find_deny_match(&policy.prefixes, &policy.deny, argv) {
+    if deny_match(policy, argv).is_some() {
         return PolicyDecision::Deny;
     }
     if let Some(matched) = find_rule_match(&policy.prefixes, &policy.ask, argv) {

@@ -435,12 +435,12 @@ fn shell_authorization_uses_session_cache_per_unit() {
 }
 
 #[test]
-fn wrapped_shell_authorization_prompts_live_asks_in_order() {
+fn stacked_wrapped_shell_authorization_prompts_live_asks_in_order() {
     let directory = tempfile::tempdir().expect("tempdir");
     let config = directory.path().join("saferun.yaml");
     std::fs::write(
         &config,
-        "prefixes: ['env *']\nshell_prefixes: ['bash -c']\nallow: [/bin/true]\nask:\n  - git push **\n  - gh pr create **\n",
+        "prefixes:\n  - command\n  - env *\nshell_prefixes: ['bash -c']\nallow: [/bin/true]\nask:\n  - git push **\n  - gh pr create **\n",
     )
     .expect("write config");
     let policy = load_policy(&config).expect("load policy");
@@ -471,6 +471,7 @@ fn wrapped_shell_authorization_prompts_live_asks_in_order() {
     let outcome = authorize_invocation(
         &policy,
         &[
+            "command".to_string(),
             "env".to_string(),
             "A=1".to_string(),
             "B=2".to_string(),

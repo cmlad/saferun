@@ -592,6 +592,56 @@ mod tests {
     }
 
     #[test]
+    fn shell_empty_payload_authorizes_without_prompting() {
+        let (_directory, config, policy) =
+            policy("shell_prefixes: ['bash -c']\nallow: [/bin/true]\nask: ['**']\n");
+        let client = QueueClient::new([Err("must not be called")]);
+        let command = argv(&["bash", "-c", ""]);
+        let outcome = authorize_invocation(&policy, &command, &config, false, None, &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Execute {
+            aggregate_kind,
+            units,
+        }) = outcome
+        else {
+            panic!("expected shell execution");
+        };
+        assert_eq!(aggregate_kind, AuthorizationKind::Allow);
+        assert!(units.is_empty());
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn shell_extra_arguments_force_one_exact_opaque_approval() {
+        let (_directory, config, policy) =
+            policy("shell_prefixes: ['bash -c']\nallow:\n  - cargo test\nask:\n  - cargo test\n");
+        let client = QueueClient::new([approved(ApprovalScope::Once)]);
+        let command = argv(&["bash", "-c", "cargo test", "bash"]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[13; 32]), &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Execute {
+            aggregate_kind,
+            units,
+        }) = outcome
+        else {
+            panic!("expected shell execution");
+        };
+        assert_eq!(aggregate_kind, AuthorizationKind::Ask);
+        assert_eq!(units.len(), 1);
+        assert_eq!(
+            units[0].unit.approval_command(),
+            &["bash -c 'cargo test' bash"]
+        );
+        assert_eq!(units[0].approval, Some(ApprovalScope::Once));
+        assert!(units[0].matched.is_implicit());
+        let requests = client.requests.borrow();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].command, vec!["bash -c 'cargo test' bash"]);
+        assert!(requests[0].implicit_ask);
+    }
+
+    #[test]
     fn shell_mixed_allow_and_ask_prompts_for_asks_in_order() {
         let (_directory, config, policy) = policy(
             "shell_prefixes: ['bash -c']\nallow:\n  - cargo test\nask:\n  - git push **\n  - gh pr create **\n",

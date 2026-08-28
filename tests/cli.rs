@@ -190,6 +190,40 @@ fn shell_dry_run_prints_parts_and_aggregate_decision() {
 }
 
 #[test]
+fn shell_dry_run_prints_parts_inside_outer_generic_prefix() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = temp.path().join("saferun.yaml");
+    std::fs::write(
+        &config,
+        "prefixes: ['env *']\nshell_prefixes: ['bash -c']\nallow:\n  - cargo test\nask:\n  - git push **\n",
+    )
+    .expect("write config");
+    let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
+        .args(["--config"])
+        .arg(&config)
+        .args([
+            "--dry-run",
+            "--",
+            "env",
+            "X=1",
+            "bash",
+            "-c",
+            "cargo test; git push origin main",
+        ])
+        .output()
+        .expect("run saferun");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"PART 1/2 ALLOW cargo test (allow='cargo test')\n\
+          PART 2/2 ASK git push origin main (ask='git push **')\n\
+          ASK env X=1 bash -c 'cargo test; git push origin main' (shell_parts=2)\n"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
 fn nested_shell_dry_run_is_denied_with_diagnostic() {
     let temp = tempfile::tempdir().expect("tempdir");
     let config = temp.path().join("saferun.yaml");

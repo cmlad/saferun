@@ -1,6 +1,8 @@
 use agent_shell_parser::parse::{parse_with_substitutions, Operator, ParsedPipeline, ShellSegment};
 
-use crate::policy::{shell_prefix_matches, shlex_join, shlex_quote, Policy};
+use crate::policy::{
+    configured_prefix_remainders, shell_prefix_matches, shlex_join, shlex_quote, Policy,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellCommandUnit {
@@ -31,8 +33,11 @@ pub struct ShellInvocation {
 }
 
 pub fn analyze_shell_invocation(policy: &Policy, argv: &[String]) -> Option<ShellInvocation> {
-    let prefix = shell_prefix_matches(policy, argv).into_iter().next()?;
-    let remainder = argv.get(prefix.parts_consumed()..).unwrap_or(&[]);
+    let shell_match = find_shell_invocation(policy, argv)?;
+    let remainder = shell_match
+        .effective_argv
+        .get(shell_match.shell_parts_consumed..)
+        .unwrap_or(&[]);
     let payload = remainder.first().map(String::as_str);
     let parsed = payload.and_then(|script| parse_with_substitutions(script).ok());
     let static_commands = parsed.as_ref().map(static_commands).unwrap_or_default();
@@ -47,6 +52,34 @@ pub fn analyze_shell_invocation(policy: &Policy, argv: &[String]) -> Option<Shel
         units,
         static_commands,
     })
+}
+
+struct ShellInvocationMatch<'a> {
+    effective_argv: &'a [String],
+    shell_parts_consumed: usize,
+}
+
+fn find_shell_invocation<'a>(
+    policy: &Policy,
+    argv: &'a [String],
+) -> Option<ShellInvocationMatch<'a>> {
+    if let Some(prefix) = shell_prefix_matches(policy, argv).into_iter().next() {
+        return Some(ShellInvocationMatch {
+            effective_argv: argv,
+            shell_parts_consumed: prefix.parts_consumed(),
+        });
+    }
+
+    for remainder in configured_prefix_remainders(policy, argv) {
+        if let Some(prefix) = shell_prefix_matches(policy, remainder).into_iter().next() {
+            return Some(ShellInvocationMatch {
+                effective_argv: remainder,
+                shell_parts_consumed: prefix.parts_consumed(),
+            });
+        }
+    }
+
+    None
 }
 
 fn decompose_payload(payload: &str, parsed: Option<&ParsedPipeline>) -> Vec<ShellCommandUnit> {
@@ -274,6 +307,34 @@ mod tests {
             ]
         );
         assert!(analyze(&["zsh", "-lc", "cargo test"]).is_none());
+    }
+
+    #[test]
+    fn configured_generic_prefixes_compose_with_shell_prefixes() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let policy_path = directory.path().join("saferun.yaml");
+        std::fs::write(
+            &policy_path,
+            "prefixes:\n  - env *\nshell_prefixes:\n  - bash -c\nallow: [/bin/true]\n",
+        )
+        .expect("write policy");
+        let policy = load_policy(&policy_path).expect("load policy");
+        let argv = [
+            "env".to_string(),
+            "X=1".to_string(),
+            "bash".to_string(),
+            "-c".to_string(),
+            "cargo test; git status".to_string(),
+        ];
+        let invocation = analyze_shell_invocation(&policy, &argv).expect("shell invocation");
+
+        assert_eq!(
+            invocation.units,
+            vec![
+                ShellCommandUnit::Parsed(vec!["cargo".into(), "test".into()]),
+                ShellCommandUnit::Parsed(vec!["git".into(), "status".into()]),
+            ]
+        );
     }
 
     #[test]

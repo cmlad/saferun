@@ -686,6 +686,73 @@ mod tests {
     }
 
     #[test]
+    fn shell_denial_inside_outer_generic_prefix_is_detected_before_prompting() {
+        let (_directory, config, policy) = policy(
+            "prefixes: ['env *']\nshell_prefixes: ['bash -c']\nallow: [/bin/true]\nask: ['git push **']\ndeny: ['rm **']\n",
+        );
+        let client = QueueClient::new([approved(ApprovalScope::Once)]);
+        let command = argv(&[
+            "env",
+            "X=1",
+            "bash",
+            "-c",
+            "git push origin main; rm target",
+        ]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[10; 32]), &client);
+
+        assert!(matches!(
+            outcome,
+            InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
+                diagnostic: None
+            })
+        ));
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn shell_parts_inside_outer_generic_prefix_are_classified_independently() {
+        let (_directory, config, policy) = policy(
+            "prefixes: ['env *']\nshell_prefixes: ['bash -c']\nallow:\n  - cargo test\nask:\n  - git push **\n",
+        );
+        let client = QueueClient::new([Err("must not be called")]);
+        let command = argv(&[
+            "env",
+            "X=1",
+            "bash",
+            "-c",
+            "cargo test; git push origin main",
+        ]);
+        let outcome = authorize_invocation(&policy, &command, &config, true, None, &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::DryRun {
+            aggregate_kind,
+            units,
+        }) = outcome
+        else {
+            panic!("expected shell dry-run");
+        };
+        assert_eq!(aggregate_kind, AuthorizationKind::Ask);
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].kind, AuthorizationKind::Allow);
+        assert_eq!(
+            units[0].unit,
+            ShellCommandUnit::Parsed(vec!["cargo".into(), "test".into()])
+        );
+        assert_eq!(units[1].kind, AuthorizationKind::Ask);
+        assert_eq!(
+            units[1].unit,
+            ShellCommandUnit::Parsed(vec![
+                "git".into(),
+                "push".into(),
+                "origin".into(),
+                "main".into()
+            ])
+        );
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
     fn shell_command_position_brace_expansion_cannot_use_literal_allow_to_bypass_deny() {
         let (_directory, config, policy) =
             policy("shell_prefixes: ['bash -c']\nallow:\n  - r{m,} target\ndeny:\n  - rm **\n");

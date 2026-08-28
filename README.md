@@ -48,7 +48,7 @@ deny:
 `allow` must contain at least one entry. The other lists are optional:
 
 - `prefixes` recognizes leading wrappers such as `env` or `sudo` and strips them before `ask` and `allow` matching. Deny still checks both the full command and each stripped remainder.
-- `shell_prefixes` recognizes explicit shell invocations whose payload should be inspected. Only configured variants are parsed; ordinary `prefixes` remain argv-only.
+- `shell_prefixes` recognizes explicit shell invocations whose payload should be inspected. Only configured variants are parsed; ordinary `prefixes` remain argv-only, but they can wrap a configured shell prefix.
 - `allow` executes matching commands without prompting.
 - `ask` requires interactive approval before execution.
 - `deny` blocks matching commands without prompting.

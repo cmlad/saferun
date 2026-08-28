@@ -9,8 +9,8 @@ use crate::approval::{
 };
 use crate::policy::{classify, is_denied, shell_prefix_matches, Policy, PolicyDecision, RuleMatch};
 use crate::shell::{
-    analyze_shell_invocation, shell_prefix_candidates_for_shell_command, strip_leading_assignments,
-    ShellCommandUnit, ShellInvocation,
+    analyze_shell_invocation, shell_prefix_candidates_for_shell_command, ShellCommandUnit,
+    ShellInvocation,
 };
 
 pub const DENIED_EXIT_CODE: i32 = 126;
@@ -269,8 +269,9 @@ fn classify_unit<'a>(
 }
 
 fn denied(policy: &Policy, argv: &[String]) -> bool {
-    is_denied(policy, argv)
-        || strip_leading_assignments(argv).is_some_and(|effective| is_denied(policy, effective))
+    shell_prefix_candidates_for_shell_command(policy, argv)
+        .into_iter()
+        .any(|candidate| is_denied(policy, candidate))
 }
 
 fn nested_shell_command(policy: &Policy, argv: &[String]) -> Option<Vec<String>> {
@@ -678,6 +679,25 @@ mod tests {
         let command = argv(&["env", "A=1", "B=2", "bash", "-c", "rm target"]);
         let outcome =
             authorize_invocation(&policy, &command, &config, false, Some(&[11; 32]), &client);
+
+        assert!(matches!(
+            outcome,
+            InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
+                diagnostic: None
+            })
+        ));
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn shell_denial_inside_stacked_generic_wrappers_is_detected_before_prompting() {
+        let (_directory, config, policy) = policy(
+            "prefixes:\n  - command\n  - env *\nshell_prefixes: ['bash -c']\nallow: [/bin/true]\nask: ['**']\ndeny: ['rm **']\n",
+        );
+        let client = QueueClient::new([approved(ApprovalScope::Once)]);
+        let command = argv(&["bash", "-c", "command env A=1 B=2 rm target; git status"]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[12; 32]), &client);
 
         assert!(matches!(
             outcome,

@@ -63,7 +63,7 @@ fn find_shell_invocation<'a>(
     policy: &Policy,
     argv: &'a [String],
 ) -> Option<ShellInvocationMatch<'a>> {
-    for candidate in shell_invocation_candidates(policy, argv) {
+    for candidate in shell_prefix_candidates_for_invocation(policy, argv) {
         if let Some(prefix) = shell_prefix_matches(policy, candidate).into_iter().next() {
             return Some(ShellInvocationMatch {
                 effective_argv: candidate,
@@ -75,9 +75,30 @@ fn find_shell_invocation<'a>(
     None
 }
 
-fn shell_invocation_candidates<'a>(policy: &Policy, argv: &'a [String]) -> Vec<&'a [String]> {
+fn shell_prefix_candidates_for_invocation<'a>(
+    policy: &Policy,
+    argv: &'a [String],
+) -> Vec<&'a [String]> {
+    shell_prefix_candidates(policy, argv, false)
+}
+
+pub(crate) fn shell_prefix_candidates_for_shell_command<'a>(
+    policy: &Policy,
+    argv: &'a [String],
+) -> Vec<&'a [String]> {
+    shell_prefix_candidates(policy, argv, true)
+}
+
+fn shell_prefix_candidates<'a>(
+    policy: &Policy,
+    argv: &'a [String],
+    include_initial_assignments: bool,
+) -> Vec<&'a [String]> {
     let mut candidates = Vec::new();
     push_candidate(&mut candidates, argv);
+    if include_initial_assignments {
+        push_assignment_stripped_candidate(&mut candidates, argv);
+    }
 
     let mut index = 0;
     while index < candidates.len() {
@@ -86,9 +107,7 @@ fn shell_invocation_candidates<'a>(policy: &Policy, argv: &'a [String]) -> Vec<&
 
         for remainder in configured_prefix_remainders(policy, candidate) {
             push_candidate(&mut candidates, remainder);
-            if let Some(effective) = strip_leading_assignments(remainder) {
-                push_candidate(&mut candidates, effective);
-            }
+            push_assignment_stripped_candidate(&mut candidates, remainder);
         }
     }
 
@@ -102,6 +121,15 @@ fn push_candidate<'a>(candidates: &mut Vec<&'a [String]>, candidate: &'a [String
         return;
     }
     candidates.push(candidate);
+}
+
+fn push_assignment_stripped_candidate<'a>(
+    candidates: &mut Vec<&'a [String]>,
+    candidate: &'a [String],
+) {
+    if let Some(effective) = strip_leading_assignments(candidate) {
+        push_candidate(candidates, effective);
+    }
 }
 
 fn decompose_payload(payload: &str, parsed: Option<&ParsedPipeline>) -> Vec<ShellCommandUnit> {
@@ -231,7 +259,7 @@ fn has_unquoted_redirection(value: &str) -> bool {
     has_unquoted_meta(value, &['<', '>'])
 }
 
-fn strip_leading_assignments(argv: &[String]) -> Option<&[String]> {
+pub(crate) fn strip_leading_assignments(argv: &[String]) -> Option<&[String]> {
     let first_command = argv.iter().position(|part| !is_assignment(part))?;
     if first_command == 0 {
         None

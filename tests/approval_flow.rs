@@ -433,3 +433,80 @@ fn shell_authorization_uses_session_cache_per_unit() {
     assert_eq!(*calls.lock().expect("calls lock"), 1);
     assert_eq!(choices.lock().expect("choices lock").len(), 1);
 }
+
+#[test]
+fn wrapped_shell_authorization_prompts_live_asks_in_order() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let config = directory.path().join("saferun.yaml");
+    std::fs::write(
+        &config,
+        "prefixes: ['env *']\nshell_prefixes: ['bash -c']\nallow: [/bin/true]\nask:\n  - git push **\n  - gh pr create **\n",
+    )
+    .expect("write config");
+    let policy = load_policy(&config).expect("load policy");
+    let socket = directory.path().join("approval.sock");
+    let listener = bind_test_socket(&socket);
+
+    let choices = Arc::new(Mutex::new(VecDeque::from([
+        PromptChoice::AllowOnce,
+        PromptChoice::AllowSession(SessionSelection::MatchedAskRule),
+    ])));
+    let calls = Arc::new(Mutex::new(0_usize));
+    let server_choices = Arc::clone(&choices);
+    let server_calls = Arc::clone(&calls);
+    let server = thread::spawn(move || {
+        let cache = Mutex::new(SessionCache::with_capacity(8));
+        let prompter = Mutex::new(SharedPrompter {
+            choices: server_choices,
+            calls: server_calls,
+        });
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept");
+            handle_connection(&mut stream, &cache, &prompter).expect("dispatch");
+        }
+    });
+
+    let client = SocketApprovalClient::with_path(&socket);
+    let token = [14_u8; 32];
+    let outcome = authorize_invocation(
+        &policy,
+        &[
+            "env".to_string(),
+            "A=1".to_string(),
+            "B=2".to_string(),
+            "bash".to_string(),
+            "-c".to_string(),
+            "git push origin main; gh pr create --fill".to_string(),
+        ],
+        &config,
+        false,
+        Some(&token),
+        &client,
+    );
+
+    let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Execute {
+        aggregate_kind,
+        units,
+    }) = outcome
+    else {
+        panic!("expected shell execution");
+    };
+    assert_eq!(aggregate_kind, AuthorizationKind::Ask);
+    assert_eq!(units.len(), 2);
+    assert_eq!(units[0].kind, AuthorizationKind::Ask);
+    assert_eq!(units[0].approval, Some(ApprovalScope::Once));
+    assert_eq!(
+        units[0].unit.approval_command(),
+        &["git", "push", "origin", "main"]
+    );
+    assert_eq!(units[1].kind, AuthorizationKind::Ask);
+    assert_eq!(units[1].approval, Some(ApprovalScope::Session));
+    assert_eq!(
+        units[1].unit.approval_command(),
+        &["gh", "pr", "create", "--fill"]
+    );
+
+    server.join().expect("server thread");
+    assert_eq!(*calls.lock().expect("calls lock"), 2);
+    assert!(choices.lock().expect("choices lock").is_empty());
+}

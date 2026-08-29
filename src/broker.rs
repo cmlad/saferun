@@ -452,8 +452,9 @@ struct SessionScopeOption {
     selection: SessionSelection,
 }
 
-/// Session-scope menu entries in display order; the first entry is the
-/// effective executable and therefore the default grant.
+/// Session-scope menu entries in display order. The first entry is the default
+/// grant: normally the effective executable, but exact unit scope for synthetic
+/// redirection approval commands.
 fn session_scope_options(request: &ApprovalRequest) -> Vec<SessionScopeOption> {
     let effective = effective_command(request);
     let mut options = Vec::with_capacity(effective.len() + 2);

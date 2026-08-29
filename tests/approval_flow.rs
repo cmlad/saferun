@@ -597,6 +597,118 @@ fn shell_authorization_uses_session_cache_per_unit() {
 }
 
 #[test]
+fn redirection_session_scope_caches_exact_target_only() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let config = directory.path().join("saferun.yaml");
+    std::fs::write(
+        &config,
+        "shell_prefixes: ['bash -c']\nallow:\n  - printf hi\nask:\n  - '> **'\n",
+    )
+    .expect("write config");
+    let policy = load_policy(&config).expect("load policy");
+    let socket = directory.path().join("approval.sock");
+    let listener = bind_test_socket(&socket);
+
+    let choices = Arc::new(Mutex::new(VecDeque::from([
+        PromptChoice::AllowSession(SessionSelection::EffectiveCommandPrefix { parts: 2 }),
+        PromptChoice::Deny,
+    ])));
+    let calls = Arc::new(Mutex::new(0_usize));
+    let server_choices = Arc::clone(&choices);
+    let server_calls = Arc::clone(&calls);
+    let server = thread::spawn(move || {
+        let cache = Mutex::new(SessionCache::with_capacity(8));
+        let prompter = Mutex::new(SharedPrompter {
+            choices: server_choices,
+            calls: server_calls,
+        });
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().expect("accept");
+            handle_connection(&mut stream, &cache, &prompter).expect("dispatch");
+        }
+    });
+
+    let client = SocketApprovalClient::with_path(&socket);
+    let token = [18_u8; 32];
+    let first = authorize_invocation(
+        &policy,
+        &[
+            "bash".to_string(),
+            "-c".to_string(),
+            "printf hi > out.log".to_string(),
+        ],
+        &config,
+        false,
+        Some(&token),
+        &client,
+    );
+    assert!(
+        matches!(
+            &first,
+            InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Execute {
+                aggregate_kind: AuthorizationKind::Ask,
+                units,
+            }) if units.len() == 2
+                && units[1].approval == Some(ApprovalScope::Session)
+                && units[1].unit.approval_command() == [">".to_string(), "out.log".to_string()]
+        ),
+        "{first:?}"
+    );
+
+    let cached = authorize_invocation(
+        &policy,
+        &[
+            "bash".to_string(),
+            "-c".to_string(),
+            "printf hi > out.log".to_string(),
+        ],
+        &config,
+        false,
+        Some(&token),
+        &client,
+    );
+    assert!(
+        matches!(
+            &cached,
+            InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Execute {
+                aggregate_kind: AuthorizationKind::Ask,
+                units,
+            }) if units.len() == 2
+                && units[1].approval == Some(ApprovalScope::Session)
+                && units[1].unit.approval_command() == [">".to_string(), "out.log".to_string()]
+        ),
+        "{cached:?}"
+    );
+
+    let other_target = authorize_invocation(
+        &policy,
+        &[
+            "bash".to_string(),
+            "-c".to_string(),
+            "printf hi > other.log".to_string(),
+        ],
+        &config,
+        false,
+        Some(&token),
+        &client,
+    );
+    assert!(
+        matches!(
+            &other_target,
+            InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
+                diagnostic: None,
+                ..
+            })
+        ),
+        "{other_target:?}"
+    );
+
+    server.join().expect("server thread");
+    assert_eq!(*calls.lock().expect("calls lock"), 2);
+    assert!(choices.lock().expect("choices lock").is_empty());
+}
+
+#[test]
 fn all_commands_session_scope_covers_later_ask_units_in_shell_invocation() {
     let directory = tempfile::tempdir().expect("tempdir");
     let config = directory.path().join("saferun.yaml");

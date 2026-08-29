@@ -44,7 +44,7 @@ fn session_token_subcommand_rejects_arguments() {
 }
 
 #[test]
-fn session_token_environment_rejects_files_outside_runtime() {
+fn token_argument_rejects_files_outside_runtime() {
     let temp = tempfile::tempdir().expect("tempdir");
     let config = temp.path().join("saferun.yaml");
     let token = temp.path().join("token");
@@ -58,7 +58,8 @@ fn session_token_environment_rejects_files_outside_runtime() {
         .expect("secure token mode");
 
     let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
-        .env(saferun::approval::SESSION_TOKEN_FILE_ENV, &token)
+        .arg("-t")
+        .arg(&token)
         .args(["--config"])
         .arg(&config)
         .args(["--", "/bin/true"])
@@ -70,7 +71,7 @@ fn session_token_environment_rejects_files_outside_runtime() {
 }
 
 #[test]
-fn token_environment_preserves_child_stdin() {
+fn token_argument_preserves_child_stdin() {
     let temp = tempfile::tempdir().expect("tempdir");
     let config = temp.path().join("saferun.yaml");
     std::fs::write(&config, "allow:\n  - /bin/cat\n").expect("write config");
@@ -86,7 +87,8 @@ fn token_environment_preserves_child_stdin() {
     );
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_saferun"))
-        .env(saferun::approval::SESSION_TOKEN_FILE_ENV, &token_path)
+        .arg("-t")
+        .arg(&token_path)
         .args(["--config"])
         .arg(&config)
         .args(["--", "/bin/cat"])
@@ -110,10 +112,12 @@ fn token_environment_preserves_child_stdin() {
 }
 
 #[test]
-fn token_environment_is_removed_before_exec() {
+fn legacy_token_environment_does_not_supply_ask_token() {
     let temp = tempfile::tempdir().expect("tempdir");
     let config = temp.path().join("saferun.yaml");
-    std::fs::write(&config, "allow:\n  - /usr/bin/env\n").expect("write config");
+    std::fs::write(&config, "allow:\n  - /bin/true\nask:\n  - /usr/bin/touch\n")
+        .expect("write config");
+    let target = temp.path().join("ask-target");
     let token_output = Command::new(env!("CARGO_BIN_EXE_saferun"))
         .arg("session-token")
         .output()
@@ -126,18 +130,31 @@ fn token_environment_is_removed_before_exec() {
     );
 
     let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
-        .env(saferun::approval::SESSION_TOKEN_FILE_ENV, &token_path)
+        .env("SAFERUN_TOKEN_FILE", &token_path)
         .args(["--config"])
         .arg(&config)
-        .args(["--", "/usr/bin/env"])
+        .args(["--", "/usr/bin/touch"])
+        .arg(&target)
         .output()
         .expect("run saferun");
 
-    assert!(output.status.success(), "{output:?}");
-    assert!(!String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .any(|line| line.starts_with("SAFERUN_TOKEN_FILE=")));
+    assert_eq!(output.status.code(), Some(126));
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("saferun: ask command requires -t TOKEN_FILE"));
+    assert!(!target.exists());
     std::fs::remove_file(token_path).expect("remove token");
+}
+
+#[test]
+fn token_argument_requires_value() {
+    let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
+        .arg("-t")
+        .output()
+        .expect("run saferun");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("saferun: error: argument -t: expected one argument"));
 }
 
 #[test]

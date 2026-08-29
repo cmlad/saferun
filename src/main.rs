@@ -5,12 +5,11 @@
 
 use std::env;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 use saferun::approval::{
     create_session_token_file, read_session_token_file, ApprovalScope, SocketApprovalClient,
-    SESSION_TOKEN_FILE_ENV,
 };
 use saferun::authorization::{
     authorize_invocation, AuthorizationKind, AuthorizationOutcome, InvocationAuthorizationOutcome,
@@ -25,6 +24,7 @@ fn default_config_path() -> PathBuf {
 
 struct Args {
     config: PathBuf,
+    token_file: Option<PathBuf>,
     dry_run: bool,
     explain: bool,
     command: Vec<String>,
@@ -33,7 +33,7 @@ struct Args {
 /// Print usage to stderr and exit, mimicking argparse error handling.
 fn arg_error(message: &str) -> ! {
     eprintln!(
-        "usage: saferun [-h] [--config CONFIG] [--dry-run] [--explain] -- command ...\n\
+        "usage: saferun [-h] [--config CONFIG] [-t TOKEN_FILE] [--dry-run] [--explain] -- command ...\n\
          \x20      saferun session-token"
     );
     eprintln!("saferun: error: {message}");
@@ -44,6 +44,7 @@ fn arg_error(message: &str) -> ! {
 /// bare `--`) is treated as the command, like argparse's REMAINDER.
 fn parse_args(raw: Vec<String>) -> Args {
     let mut config = default_config_path();
+    let mut token_file: Option<PathBuf> = None;
     let mut dry_run = false;
     let mut explain = false;
     let mut command: Vec<String> = Vec::new();
@@ -54,6 +55,13 @@ fn parse_args(raw: Vec<String>) -> Args {
         match arg {
             "--dry-run" => dry_run = true,
             "--explain" => explain = true,
+            "-t" => {
+                index += 1;
+                let Some(value) = raw.get(index) else {
+                    arg_error("argument -t: expected one argument");
+                };
+                token_file = Some(PathBuf::from(value));
+            }
             "--config" | "-c" => {
                 index += 1;
                 let Some(value) = raw.get(index) else {
@@ -63,7 +71,7 @@ fn parse_args(raw: Vec<String>) -> Args {
             }
             "-h" | "--help" => {
                 println!(
-                    "usage: saferun [-h] [--config CONFIG] [--dry-run] [--explain] -- command ...\n\
+                    "usage: saferun [-h] [--config CONFIG] [-t TOKEN_FILE] [--dry-run] [--explain] -- command ...\n\
                      \x20      saferun session-token"
                 );
                 println!("\nRun a command only when allowed");
@@ -93,6 +101,7 @@ fn parse_args(raw: Vec<String>) -> Args {
 
     Args {
         config,
+        token_file,
         dry_run,
         explain,
         command,
@@ -117,10 +126,8 @@ fn run() -> i32 {
         };
     }
     let args = parse_args(raw);
-    let session_token_file = env::var_os(SESSION_TOKEN_FILE_ENV);
-    env::remove_var(SESSION_TOKEN_FILE_ENV);
-    let session_token = match session_token_file {
-        Some(path) => match read_session_token_file(Path::new(&path)) {
+    let session_token = match args.token_file.as_deref() {
+        Some(path) => match read_session_token_file(path) {
             Ok(token) => Some(token),
             Err(error) => {
                 eprintln!("saferun: invalid session token: {error}");

@@ -103,10 +103,11 @@ Session grants follow the agent token across working directories and equivalent 
 Create one token file per agent session and retain its path:
 
 ```bash
-export SAFERUN_TOKEN_FILE="$(saferun session-token)"
+token_file="$(saferun session-token)"
+saferun -t "$token_file" -- git status
 ```
 
-`saferun session-token` creates a `0600` file in the UID-owned `0700` runtime directory and prints only its non-secret path. It does not load policy or require an existing token. `saferun` validates and reads the file, then removes `SAFERUN_TOKEN_FILE` before executing the command. Never put token contents in environment values, argv, or stdin.
+`saferun session-token` creates a `0600` file in the UID-owned `0700` runtime directory and prints only its non-secret path. It does not load policy or require an existing token. `saferun` validates and reads the file passed as `-t TOKEN_FILE`. The path is non-secret and visible in saferun's argv while it runs, but `-t` and its value are consumed by `saferun` and are not forwarded to the authorized child's argv or environment. Never put token contents in environment values, argv, or stdin.
 
 Add this policy to `~/.codex/AGENTS.md` or `~/.claude/CLAUDE.md`:
 
@@ -116,12 +117,13 @@ Add this policy to `~/.codex/AGENTS.md` or `~/.claude/CLAUDE.md`:
 Run every shell command through `saferun` so it is checked against `~/config/saferun.yaml`.
 
 ```bash
-saferun -- git status
-saferun -- cargo test
-saferun -- kubectl -n monitoring get pods
+token_file="$(saferun session-token)"
+saferun -t "$token_file" -- git status
+saferun -t "$token_file" -- cargo test
+saferun -t "$token_file" -- kubectl -n monitoring get pods
 ```
 
-When printing commands for the user, omit `saferun --`. Commands run by the agent must retain it.
+When printing commands for the user, omit the `saferun` wrapper. Commands run by the agent must retain it.
 ````
 
 Restrict the agent's native shell permissions to `saferun`.
@@ -147,21 +149,21 @@ This is a cooperative boundary between sibling agents under one Unix account. Di
 ## Usage
 
 ```bash
-saferun -- <command> [args...]
+saferun [-h] [--config CONFIG] [-t TOKEN_FILE] [--dry-run] [--explain] -- <command> [args...]
 ```
 
 Examples:
 
 ```bash
-saferun -- git status
-saferun -- cargo test
-saferun -- kubectl -n monitoring get pods
+saferun -t "$token_file" -- git status
+saferun -t "$token_file" -- cargo test
+saferun -t "$token_file" -- kubectl -n monitoring get pods
 ```
 
 Select another policy with `--config` or `-c`:
 
 ```bash
-saferun --config ./saferun.yaml -- git status
+saferun -t "$token_file" --config ./saferun.yaml -- git status
 ```
 
 ## Checking Rules
@@ -178,8 +180,8 @@ Allowed commands print `ALLOW`; configured and implicit asks print `ASK`. Both e
 `--explain` prints the matching rule before execution:
 
 ```bash
-saferun --explain -- git status
-saferun --explain -- git push origin main
+saferun -t "$token_file" --explain -- git status
+saferun -t "$token_file" --explain -- git push origin main
 ```
 
 Approved asks report `approval='once'` or `approval='session'`; the selected session scope is not part of the response.
@@ -223,6 +225,6 @@ cargo test
 - `126`: command denied, approval unavailable/denied/failed, or execution failed
 - `127`: authorized command not found
 
-An actual ask without `SAFERUN_TOKEN_FILE` fails closed. The token must be an owned `0600` regular file in the UID-owned `0700` runtime directory containing exactly 64 ASCII hexadecimal bytes and an optional final LF.
+An actual ask without `-t TOKEN_FILE` fails closed. The token must be an owned `0600` regular file in the UID-owned `0700` runtime directory containing exactly 64 ASCII hexadecimal bytes and an optional final LF.
 
-Authorized commands run through Unix `exec`, preserving PID and stdio without exposing the token-file path.
+Authorized commands run through Unix `exec`, preserving PID and stdio; the authorized child never receives `-t` or the token-file path.

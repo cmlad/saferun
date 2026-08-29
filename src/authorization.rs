@@ -325,7 +325,7 @@ fn request_approval(
 ) -> Result<ApprovalScope, Option<String>> {
     let Some(token) = token else {
         return Err(Some(
-            "saferun: ask command requires SAFERUN_TOKEN_FILE".to_string(),
+            "saferun: ask command requires -t TOKEN_FILE".to_string(),
         ));
     };
 
@@ -482,7 +482,13 @@ mod tests {
         };
         let missing = authorize_command(&policy, &command, &config, false, None, &client);
         assert_eq!(missing.exit_code(), Some(DENIED_EXIT_CODE));
-        assert!(matches!(missing, AuthorizationOutcome::Denied { .. }));
+        let AuthorizationOutcome::Denied { diagnostic } = &missing else {
+            panic!("missing token must deny");
+        };
+        assert_eq!(
+            diagnostic.as_deref(),
+            Some("saferun: ask command requires -t TOKEN_FILE")
+        );
         assert_eq!(client.calls.get(), 0);
 
         let failed = authorize_command(&policy, &command, &config, false, Some(&[7; 32]), &client);

@@ -67,7 +67,7 @@ When a configured `shell_prefixes` rule leaves exactly one payload argument, `sa
 
 Unsupported shell syntax is not auto-allowed. Dynamic or unsupported redirection forms, substitutions, variables, globs, `||`, backgrounding, newlines, assignments, control flow, grouping, functions, heredocs, malformed syntax, and shell invocations with extra argv are treated as opaque implicit asks. Unsupported redirections include fd-specific redirects such as `2> file`, non-stdout operators such as `>|` or `&>`, input redirects, variable/substitution/glob targets, and redirections with non-target arguments after the target. Opaque requests are sent to the approval UI as one quoted string, so a session grant applies to that exact fragment rather than to `bash` or `zsh` broadly.
 
-Before any approval prompt, `saferun` checks the original invocation and all statically extracted commands, including commands inside opaque constructs, against `deny`. Any attempt to run `saferun` from inside `saferun` is denied without prompting, including behind a recognized generic prefix. Any configured shell prefix found inside a parsed shell payload is also denied without prompting.
+Before any approval prompt, `saferun` checks the original invocation and all statically extracted commands, including commands inside opaque constructs, against `deny`. Any attempt to run a child command whose executable basename is `saferun` is denied without prompting, including paths such as `./saferun`, case variants such as `SaFeRuN`, and commands behind a recognized generic prefix. This intentionally reserves the `saferun` command name inside `saferun`; executable identity is not resolved through `PATH`, symlinks, or canonical paths. Any configured shell prefix found inside a parsed shell payload is also denied without prompting.
 
 ## Starting the Approver
 
@@ -96,6 +96,8 @@ The broker listens only on `/tmp/saferun-<effective-uid>/approval.sock`. Live `a
 The effective command is argv after stripping a recognized configured prefix. Approving the executable for `env X=1 python3 -c first` also approves `python3 -c second` and `env Y=2 python3 -c third`, but not `ruby -e …`.
 
 For parsed shell payloads, each component is approved independently. For `/bin/zsh -lc 'cargo test; git push origin main'`, a policy can allow `cargo test` while prompting for `git push origin main`; the shell command itself runs only if both parts are authorized. For `/bin/zsh -lc 'printf hi >> out.log'`, `printf hi` and `>> out.log` are approved separately.
+
+For redirection approval prompts, the default session scope is the exact redirection unit, such as `>> out.log`, not the bare operator `>>`. Broader redirection session approval is still possible only through an explicit matched ask rule or `Allow all commands in this session`.
 
 Session grants follow the agent token across working directories and equivalent config files. They are keyed by agent token, policy digest, and selected scope. `Allow all commands in this session` approves future approval prompts for the same agent token and current policy digest. A broker restart, key change, policy change, or cache eviction requires approval again.
 

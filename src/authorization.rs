@@ -778,6 +778,28 @@ mod tests {
     }
 
     #[test]
+    fn direct_nested_saferun_detection_reserves_the_executable_basename() {
+        let (_directory, config, policy) =
+            policy("allow:\n  - /tmp/repo/bin/saferun **\nask:\n  - '**'\n");
+        let client = QueueClient::new([approved(ApprovalScope::Once)]);
+        let command = argv(&["/tmp/repo/bin/saferun", "--version"]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[2; 32]), &client);
+
+        let InvocationAuthorizationOutcome::Direct(AuthorizationOutcome::Denied {
+            diagnostic: Some(message),
+        }) = outcome
+        else {
+            panic!("expected basename-reserved nested saferun denial");
+        };
+        assert_eq!(
+            message,
+            "saferun: nested saferun invocation is not permitted: /tmp/repo/bin/saferun --version"
+        );
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
     fn implicit_prefixed_ask_forwards_prefix_metadata() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("saferun.yaml");

@@ -56,7 +56,7 @@ fn effective_command(request: &ApprovalRequest) -> &[String] {
 fn session_probe_keys(request: &ApprovalRequest) -> Vec<SessionGrantKey> {
     let effective = effective_command(request);
     let mut keys = Vec::with_capacity(effective.len() + 2);
-    for parts in (1..=effective.len()).rev() {
+    for parts in effective_command_session_parts(effective).rev() {
         keys.push(SessionGrantKey::for_target(
             request,
             SessionGrantTarget::EffectiveCommandPrefix(effective[..parts].to_vec()),
@@ -84,7 +84,7 @@ fn session_grant_target(
     match selection {
         SessionSelection::EffectiveCommandPrefix { parts } => {
             let effective = effective_command(request);
-            if !(1..=effective.len()).contains(&parts) {
+            if !effective_command_session_parts(effective).contains(&parts) {
                 return None;
             }
             Some(SessionGrantTarget::EffectiveCommandPrefix(
@@ -102,6 +102,21 @@ fn session_grant_target(
         }
         SessionSelection::AllCommands => Some(SessionGrantTarget::AllCommands),
     }
+}
+
+fn effective_command_session_parts(effective: &[String]) -> std::ops::RangeInclusive<usize> {
+    if is_redirection_effective_command(effective) {
+        effective.len()..=effective.len()
+    } else {
+        1..=effective.len()
+    }
+}
+
+fn is_redirection_effective_command(effective: &[String]) -> bool {
+    effective
+        .first()
+        .is_some_and(|operator| matches!(operator.as_str(), ">" | ">>"))
+        && effective.len() >= 2
 }
 
 #[derive(Debug)]
@@ -442,7 +457,7 @@ struct SessionScopeOption {
 fn session_scope_options(request: &ApprovalRequest) -> Vec<SessionScopeOption> {
     let effective = effective_command(request);
     let mut options = Vec::with_capacity(effective.len() + 2);
-    for parts in 1..=effective.len() {
+    for parts in effective_command_session_parts(effective) {
         options.push(SessionScopeOption {
             title: session_scope_title(&effective[..parts]),
             selection: SessionSelection::EffectiveCommandPrefix { parts },
@@ -977,6 +992,57 @@ mod tests {
             ApprovalDecision::Denied
         );
         assert_eq!(prompter.calls, 2);
+    }
+
+    #[test]
+    fn redirection_session_grant_defaults_to_exact_target() {
+        let mut cache = SessionCache::with_capacity(4);
+        let mut prompter = QueuePrompter::new([
+            PromptChoice::AllowSession(SessionSelection::EffectiveCommandPrefix { parts: 2 }),
+            PromptChoice::Deny,
+        ]);
+        let mut base = request();
+        base.command = vec![">".into(), "out.log".into()];
+        base.ask_rule_source = "> **".into();
+        assert_eq!(
+            exchange(&base, &mut cache, &mut prompter),
+            ApprovalDecision::Approved {
+                scope: ApprovalScope::Session
+            }
+        );
+        assert_eq!(
+            exchange(&base, &mut cache, &mut prompter),
+            ApprovalDecision::Approved {
+                scope: ApprovalScope::Session
+            }
+        );
+        assert_eq!(prompter.calls, 1);
+
+        let mut different_target = base;
+        different_target.command[1] = "other.log".to_string();
+        assert_eq!(
+            exchange(&different_target, &mut cache, &mut prompter),
+            ApprovalDecision::Denied
+        );
+        assert_eq!(prompter.calls, 2);
+    }
+
+    #[test]
+    fn redirection_operator_session_scope_is_rejected() {
+        let mut cache = SessionCache::with_capacity(4);
+        let mut prompter = QueuePrompter::new([PromptChoice::AllowSession(
+            SessionSelection::EffectiveCommandPrefix { parts: 1 },
+        )]);
+        let mut base = request();
+        base.command = vec![">>".into(), "out.log".into()];
+        base.ask_rule_source = ">> **".into();
+
+        assert_eq!(
+            exchange(&base, &mut cache, &mut prompter),
+            ApprovalDecision::Denied
+        );
+        assert_eq!(prompter.calls, 1);
+        assert!(cache.grants.is_empty());
     }
 
     #[test]
@@ -1629,6 +1695,27 @@ mod tests {
                 title: ALL_COMMANDS_SESSION_TITLE.to_string(),
                 selection: SessionSelection::AllCommands,
             }]
+        );
+
+        let mut redirection = request();
+        redirection.command = vec![">".to_string(), "out.log".to_string()];
+        redirection.ask_rule_source = "> **".to_string();
+        assert_eq!(
+            session_scope_options(&redirection),
+            vec![
+                SessionScopeOption {
+                    title: "> out.log".to_string(),
+                    selection: SessionSelection::EffectiveCommandPrefix { parts: 2 },
+                },
+                SessionScopeOption {
+                    title: "Matched ask rule".to_string(),
+                    selection: SessionSelection::MatchedAskRule,
+                },
+                SessionScopeOption {
+                    title: ALL_COMMANDS_SESSION_TITLE.to_string(),
+                    selection: SessionSelection::AllCommands,
+                },
+            ]
         );
     }
 

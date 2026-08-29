@@ -8,8 +8,8 @@ use crate::approval::{
     ApprovalScope, PROTOCOL_VERSION,
 };
 use crate::policy::{
-    classify, deny_match as policy_deny_match, is_denied, shell_prefix_matches, Policy,
-    PolicyDecision, RuleMatch,
+    classify, configured_prefix_consumptions, deny_match as policy_deny_match, is_denied,
+    shell_prefix_matches, Policy, PolicyDecision, RuleMatch,
 };
 use crate::shell::{
     analyze_shell_invocation, shell_prefix_candidates_for_shell_command, ShellCommandUnit,
@@ -121,10 +121,7 @@ pub fn authorize_command<'a>(
 ) -> AuthorizationOutcome<'a> {
     if let Some(nested) = nested_saferun_command(policy, command) {
         return AuthorizationOutcome::Denied {
-            diagnostic: Some(format!(
-                "saferun: nested saferun invocation is not permitted: {}",
-                crate::policy::shlex_join(&nested)
-            )),
+            diagnostic: Some(nested_saferun_diagnostic(&nested)),
         };
     }
 
@@ -164,6 +161,12 @@ pub fn authorize_invocation<'a>(
     token: Option<&[u8; 32]>,
     client: &dyn ApprovalClient,
 ) -> InvocationAuthorizationOutcome<'a> {
+    if let Some(nested) = nested_saferun_command(policy, command) {
+        return InvocationAuthorizationOutcome::Direct(AuthorizationOutcome::Denied {
+            diagnostic: Some(nested_saferun_diagnostic(&nested)),
+        });
+    }
+
     let Some(shell_invocation) = analyze_shell_invocation(policy, command) else {
         return InvocationAuthorizationOutcome::Direct(authorize_command(
             policy,
@@ -207,10 +210,7 @@ fn authorize_shell_invocation<'a>(
         .find_map(|argv| nested_saferun_command(policy, argv))
     {
         return ShellAuthorizationOutcome::Denied {
-            diagnostic: Some(format!(
-                "saferun: nested saferun invocation is not permitted: {}",
-                crate::policy::shlex_join(&nested)
-            )),
+            diagnostic: Some(nested_saferun_diagnostic(&nested)),
             units: classified,
         };
     }
@@ -335,17 +335,65 @@ fn denied(policy: &Policy, argv: &[String]) -> bool {
 }
 
 fn nested_saferun_command(policy: &Policy, argv: &[String]) -> Option<Vec<String>> {
-    shell_prefix_candidates_for_shell_command(policy, argv)
-        .into_iter()
-        .find(|candidate| is_saferun_command(candidate))
-        .map(<[String]>::to_vec)
+    let mut candidates = Vec::new();
+    push_nested_candidate(&mut candidates, argv);
+    push_nested_assignment_stripped_candidate(&mut candidates, argv);
+
+    let mut index = 0;
+    while index < candidates.len() {
+        let candidate = candidates[index];
+        index += 1;
+
+        if is_saferun_command(candidate) {
+            return Some(candidate.to_vec());
+        }
+
+        for consumed in configured_prefix_consumptions(policy, candidate) {
+            if consumed <= candidate.len() {
+                push_nested_candidate(&mut candidates, &candidate[consumed..]);
+                push_nested_assignment_stripped_candidate(&mut candidates, &candidate[consumed..]);
+            }
+            if consumed > 0 && consumed <= candidate.len() {
+                let last_consumed = &candidate[consumed - 1..];
+                push_nested_candidate(&mut candidates, last_consumed);
+                push_nested_assignment_stripped_candidate(&mut candidates, last_consumed);
+            }
+        }
+    }
+
+    None
+}
+
+fn push_nested_candidate<'a>(candidates: &mut Vec<&'a [String]>, candidate: &'a [String]) {
+    if candidates.iter().any(|existing| {
+        existing.as_ptr() == candidate.as_ptr() && existing.len() == candidate.len()
+    }) {
+        return;
+    }
+    candidates.push(candidate);
+}
+
+fn push_nested_assignment_stripped_candidate<'a>(
+    candidates: &mut Vec<&'a [String]>,
+    candidate: &'a [String],
+) {
+    if let Some(effective) = crate::shell::strip_leading_assignments(candidate) {
+        push_nested_candidate(candidates, effective);
+    }
 }
 
 fn is_saferun_command(argv: &[String]) -> bool {
     argv.first()
         .and_then(|command| std::path::Path::new(command).file_name())
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "saferun")
+        .is_some_and(|name| name.eq_ignore_ascii_case("saferun"))
+}
+
+fn nested_saferun_diagnostic(command: &[String]) -> String {
+    format!(
+        "saferun: nested saferun invocation is not permitted: {}",
+        crate::policy::shlex_join(command)
+    )
 }
 
 fn shell_deny_match<'a>(policy: &'a Policy, argv: &[String]) -> Option<RuleMatch<'a>> {
@@ -660,6 +708,71 @@ mod tests {
         assert_eq!(
             message,
             "saferun: nested saferun invocation is not permitted: saferun --dry-run -- git status"
+        );
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn direct_nested_saferun_consumed_by_generic_prefix_is_denied() {
+        let (_directory, config, policy) =
+            policy("prefixes: ['env *']\nallow:\n  - saferun **\n  - git status\nask:\n  - '**'\n");
+        let client = QueueClient::new([approved(ApprovalScope::Once)]);
+        let command = argv(&["env", "saferun", "--dry-run", "--", "git", "status"]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[2; 32]), &client);
+
+        let InvocationAuthorizationOutcome::Direct(AuthorizationOutcome::Denied {
+            diagnostic: Some(message),
+        }) = outcome
+        else {
+            panic!("expected consumed nested saferun denial");
+        };
+        assert_eq!(
+            message,
+            "saferun: nested saferun invocation is not permitted: saferun --dry-run -- git status"
+        );
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn direct_nested_saferun_consumed_before_shell_prefix_is_denied_before_shell_analysis() {
+        let (_directory, config, policy) =
+            policy("prefixes: ['env *']\nshell_prefixes: ['bash -c']\nallow:\n  - git status\nask:\n  - '**'\n");
+        let client = QueueClient::new([approved(ApprovalScope::Once)]);
+        let command = argv(&["env", "saferun", "bash", "-c", "git status"]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[2; 32]), &client);
+
+        let InvocationAuthorizationOutcome::Direct(AuthorizationOutcome::Denied {
+            diagnostic: Some(message),
+        }) = outcome
+        else {
+            panic!("expected consumed nested saferun denial before shell analysis");
+        };
+        assert_eq!(
+            message,
+            "saferun: nested saferun invocation is not permitted: saferun bash -c 'git status'"
+        );
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn direct_nested_saferun_detection_is_case_insensitive() {
+        let (_directory, config, policy) = policy("allow:\n  - saferun **\nask:\n  - '**'\n");
+        let client = QueueClient::new([approved(ApprovalScope::Once)]);
+        let command = argv(&["SaFeRuN", "--dry-run", "--", "git", "status"]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[2; 32]), &client);
+
+        let InvocationAuthorizationOutcome::Direct(AuthorizationOutcome::Denied {
+            diagnostic: Some(message),
+        }) = outcome
+        else {
+            panic!("expected case-insensitive nested saferun denial");
+        };
+        assert_eq!(
+            message,
+            "saferun: nested saferun invocation is not permitted: SaFeRuN --dry-run -- git status"
         );
         assert_eq!(client.calls.get(), 0);
     }
@@ -1242,6 +1355,30 @@ mod tests {
         }) = outcome
         else {
             panic!("expected prefixed nested saferun denial");
+        };
+        assert_eq!(
+            message,
+            "saferun: nested saferun invocation is not permitted: saferun --dry-run -- git status"
+        );
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn nested_saferun_consumed_by_generic_prefix_in_shell_payload_is_denied() {
+        let (_directory, config, policy) = policy(
+            "prefixes: ['env *']\nshell_prefixes: ['bash -c']\nallow:\n  - saferun **\nask:\n  - '**'\n",
+        );
+        let client = QueueClient::new([approved(ApprovalScope::Once)]);
+        let command = argv(&["bash", "-c", "env saferun --dry-run -- git status"]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[8; 32]), &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
+            diagnostic: Some(message),
+            ..
+        }) = outcome
+        else {
+            panic!("expected consumed nested saferun denial");
         };
         assert_eq!(
             message,

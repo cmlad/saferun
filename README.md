@@ -23,7 +23,7 @@ The YAML config has five rule lists:
 
 ```yaml
 prefixes:
-  - "env *"
+  - "env *=*"
   - "sudo"
 
 shell_prefixes:
@@ -47,7 +47,7 @@ deny:
 
 `allow` must contain at least one entry. The other lists are optional:
 
-- `prefixes` recognizes leading wrappers such as `env` or `sudo` and strips them before `ask` and `allow` matching. Deny still checks both the full command and each stripped remainder.
+- `prefixes` recognizes leading wrappers such as `env` assignments or `sudo` and strips them before `ask` and `allow` matching. Deny still checks both the full command and each stripped remainder. For `env`, prefer assignment-shaped rules such as `env *=*` so non-assignment command words are not consumed as prefix arguments.
 - `shell_prefixes` recognizes explicit shell invocations whose payload should be inspected. Only configured variants are parsed; ordinary `prefixes` remain argv-only, but they can wrap a configured shell prefix.
 - `allow` executes matching commands without prompting.
 - `ask` requires interactive approval before execution.

@@ -442,6 +442,13 @@ pub fn configured_prefix_remainders<'a>(policy: &Policy, argv: &'a [String]) -> 
         .collect()
 }
 
+pub fn configured_prefix_consumptions(policy: &Policy, argv: &[String]) -> Vec<usize> {
+    prefix_matches(&policy.prefixes, argv)
+        .into_iter()
+        .map(|(_, consumed)| consumed)
+        .collect()
+}
+
 pub fn shell_prefix_matches<'a>(policy: &'a Policy, argv: &[String]) -> Vec<ShellPrefixMatch<'a>> {
     prefix_matches(&policy.shell_prefixes, argv)
         .into_iter()

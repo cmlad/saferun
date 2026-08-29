@@ -176,6 +176,9 @@ fn units_from_segment(segment: &ShellSegment) -> Vec<ShellCommandUnit> {
                 return vec![ShellCommandUnit::Parsed(argv)];
             }
         }
+        if let Some((argv, redirection)) = supported_static_redirection(segment) {
+            return vec![ShellCommandUnit::Parsed(argv), redirection];
+        }
         return vec![opaque(command)];
     }
 
@@ -207,10 +210,6 @@ fn is_literal_simple_command_source(segment: &ShellSegment) -> bool {
 }
 
 fn supported_static_redirection(segment: &ShellSegment) -> Option<(Vec<String>, ShellCommandUnit)> {
-    let redirection = segment.redirection.as_ref()?;
-    if redirection.fd.is_some() || !matches!(redirection.operator, ">" | ">>") {
-        return None;
-    }
     if has_unquoted_brace_expansion(segment.command.as_str())
         || has_unquoted_tilde_expansion(segment.command.as_str())
         || has_unquoted_glob(segment.command.as_str())
@@ -219,14 +218,21 @@ fn supported_static_redirection(segment: &ShellSegment) -> Option<(Vec<String>, 
     }
 
     let split = split_supported_redirection_suffix(segment.command.trim())?;
-    if split.operator != redirection.operator {
-        return None;
-    }
     let argv = shlex::split(split.command)?;
     if argv.is_empty() {
         return None;
     }
     let target = static_redirection_target(split.target)?;
+
+    match segment.redirection.as_ref() {
+        Some(redirection)
+            if redirection.fd.is_none()
+                && matches!(redirection.operator, ">" | ">>")
+                && split.operator == redirection.operator => {}
+        None if target == "/dev/null" => {}
+        _ => return None,
+    }
+
     Some((
         argv,
         ShellCommandUnit::Redirection {
@@ -260,6 +266,9 @@ fn split_supported_redirection_suffix(command: &str) -> Option<RedirectionSplit<
             '"' if !single_quoted => double_quoted = !double_quoted,
             '<' if !single_quoted && !double_quoted => return None,
             '>' if !single_quoted && !double_quoted => {
+                if command[..index].ends_with('&') {
+                    return None;
+                }
                 let operator = match chars.peek().map(|(_, next)| *next) {
                     Some('>') => {
                         chars.next();
@@ -718,6 +727,29 @@ mod tests {
     }
 
     #[test]
+    fn dev_null_stdout_redirections_decompose_after_literal_commands() {
+        assert_eq!(
+            unit_strings(&[
+                "bash",
+                "-c",
+                "printf hi > /dev/null; printf bye >> /dev/null"
+            ]),
+            vec![
+                ShellCommandUnit::Parsed(vec!["printf".into(), "hi".into()]),
+                ShellCommandUnit::Redirection {
+                    operator: ">".into(),
+                    target: "/dev/null".into(),
+                },
+                ShellCommandUnit::Parsed(vec!["printf".into(), "bye".into()]),
+                ShellCommandUnit::Redirection {
+                    operator: ">>".into(),
+                    target: "/dev/null".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn quoted_redirection_targets_can_contain_separator_characters() {
         assert_eq!(
             unit_strings(&["bash", "-c", "printf hi >> 'a;b|c&&d'"]),
@@ -754,8 +786,10 @@ mod tests {
             "echo hi > \"$OUT\"",
             "echo hi > *.log",
             "echo hi 2> file",
+            "echo hi 2> /dev/null",
             "echo hi >| file",
             "echo hi &> file",
+            "echo hi &> /dev/null",
             "echo hi > file extra",
             "echo $(date)",
             "echo $HOME",

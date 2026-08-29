@@ -241,6 +241,32 @@ fn shell_dry_run_prints_redirection_parts() {
 }
 
 #[test]
+fn shell_dry_run_prints_dev_null_redirection_part() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = temp.path().join("saferun.yaml");
+    std::fs::write(
+        &config,
+        "shell_prefixes: ['bash -c']\nallow:\n  - printf hi\nask:\n  - '> /dev/null'\n",
+    )
+    .expect("write config");
+    let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
+        .args(["--config"])
+        .arg(&config)
+        .args(["--dry-run", "--", "bash", "-c", "printf hi > /dev/null"])
+        .output()
+        .expect("run saferun");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"PART 1/2 ALLOW printf hi (allow='printf hi')\n\
+          PART 2/2 ASK > /dev/null (ask='> /dev/null')\n\
+          ASK bash -c 'printf hi > /dev/null' (shell_parts=2)\n"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
 fn shell_dry_run_prints_parts_inside_outer_generic_prefix() {
     let temp = tempfile::tempdir().expect("tempdir");
     let config = temp.path().join("saferun.yaml");
@@ -334,6 +360,39 @@ fn direct_nested_saferun_dry_run_is_denied_with_diagnostic() {
         String::from_utf8_lossy(&output.stderr),
         "saferun: nested saferun invocation is not permitted: saferun --dry-run -- git status\n\
          DENIED saferun --dry-run -- git status\n"
+    );
+}
+
+#[test]
+fn nested_saferun_consumed_by_generic_prefix_dry_run_is_denied_with_diagnostic() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = temp.path().join("saferun.yaml");
+    std::fs::write(
+        &config,
+        "prefixes: ['env *']\nshell_prefixes: ['bash -c']\nallow:\n  - git status\nask:\n  - '**'\n",
+    )
+    .expect("write config");
+    let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
+        .args(["--config"])
+        .arg(&config)
+        .args([
+            "--dry-run",
+            "--",
+            "env",
+            "saferun",
+            "bash",
+            "-c",
+            "git status",
+        ])
+        .output()
+        .expect("run saferun");
+
+    assert_eq!(output.status.code(), Some(126));
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "saferun: nested saferun invocation is not permitted: saferun bash -c 'git status'\n\
+         DENIED env saferun bash -c 'git status'\n"
     );
 }
 

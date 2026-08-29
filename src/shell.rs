@@ -7,6 +7,7 @@ use crate::policy::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellCommandUnit {
     Parsed(Vec<String>),
+    Redirection { operator: String, target: String },
     Opaque(String),
 }
 
@@ -14,6 +15,7 @@ impl ShellCommandUnit {
     pub fn approval_command(&self) -> Vec<String> {
         match self {
             Self::Parsed(argv) => argv.clone(),
+            Self::Redirection { operator, target } => vec![operator.clone(), target.clone()],
             Self::Opaque(command) => vec![command.clone()],
         }
     }
@@ -21,6 +23,9 @@ impl ShellCommandUnit {
     pub fn display_command(&self) -> String {
         match self {
             Self::Parsed(argv) => shlex_join(argv),
+            Self::Redirection { operator, target } => {
+                format!("{operator} {}", shlex_quote(target))
+            }
             Self::Opaque(command) => command.clone(),
         }
     }
@@ -151,39 +156,215 @@ fn decompose_payload(payload: &str, parsed: Option<&ParsedPipeline>) -> Vec<Shel
     pipeline
         .segments
         .iter()
-        .filter_map(unit_from_segment)
+        .flat_map(units_from_segment)
         .collect()
 }
 
-fn unit_from_segment(segment: &ShellSegment) -> Option<ShellCommandUnit> {
+fn units_from_segment(segment: &ShellSegment) -> Vec<ShellCommandUnit> {
     let command = segment.command.trim();
     if command.is_empty() {
-        return None;
+        return Vec::new();
     }
 
-    if is_literal_simple_command(segment) {
-        shlex::split(command).map(ShellCommandUnit::Parsed)
-    } else {
-        Some(opaque(command))
+    if !has_literal_command_words(segment) {
+        return vec![opaque(command)];
     }
+
+    if segment.redirection.is_none() {
+        if is_literal_simple_command_source(segment) {
+            if let Some(argv) = shlex::split(command) {
+                return vec![ShellCommandUnit::Parsed(argv)];
+            }
+        }
+        return vec![opaque(command)];
+    }
+
+    if let Some((argv, redirection)) = supported_static_redirection(segment) {
+        return vec![ShellCommandUnit::Parsed(argv), redirection];
+    }
+
+    vec![opaque(command)]
 }
 
 fn opaque(command: &str) -> ShellCommandUnit {
     ShellCommandUnit::Opaque(shlex_quote(command))
 }
 
-fn is_literal_simple_command(segment: &ShellSegment) -> bool {
-    segment.redirection.is_none()
-        && segment.substitutions.is_empty()
+fn has_literal_command_words(segment: &ShellSegment) -> bool {
+    segment.substitutions.is_empty()
         && !segment.words.is_empty()
         && !segment
             .words
             .iter()
             .any(|word| word.is_assignment() || word.is_expansion())
-        && !has_unquoted_brace_expansion(segment.command.as_str())
+}
+
+fn is_literal_simple_command_source(segment: &ShellSegment) -> bool {
+    !has_unquoted_brace_expansion(segment.command.as_str())
         && !has_unquoted_tilde_expansion(segment.command.as_str())
         && !has_unquoted_glob(segment.command.as_str())
         && !has_unquoted_redirection(segment.command.as_str())
+}
+
+fn supported_static_redirection(segment: &ShellSegment) -> Option<(Vec<String>, ShellCommandUnit)> {
+    let redirection = segment.redirection.as_ref()?;
+    if redirection.fd.is_some() || !matches!(redirection.operator, ">" | ">>") {
+        return None;
+    }
+    if has_unquoted_brace_expansion(segment.command.as_str())
+        || has_unquoted_tilde_expansion(segment.command.as_str())
+        || has_unquoted_glob(segment.command.as_str())
+    {
+        return None;
+    }
+
+    let split = split_supported_redirection_suffix(segment.command.trim())?;
+    if split.operator != redirection.operator {
+        return None;
+    }
+    let argv = shlex::split(split.command)?;
+    if argv.is_empty() {
+        return None;
+    }
+    let target = static_redirection_target(split.target)?;
+    Some((
+        argv,
+        ShellCommandUnit::Redirection {
+            operator: split.operator.to_string(),
+            target,
+        },
+    ))
+}
+
+struct RedirectionSplit<'a> {
+    command: &'a str,
+    operator: &'static str,
+    target: &'a str,
+}
+
+fn split_supported_redirection_suffix(command: &str) -> Option<RedirectionSplit<'_>> {
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    let mut found = None;
+
+    let mut chars = command.char_indices().peekable();
+    while let Some((index, character)) = chars.next() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if !single_quoted => escaped = true,
+            '\'' if !double_quoted => single_quoted = !single_quoted,
+            '"' if !single_quoted => double_quoted = !double_quoted,
+            '<' if !single_quoted && !double_quoted => return None,
+            '>' if !single_quoted && !double_quoted => {
+                let operator = match chars.peek().map(|(_, next)| *next) {
+                    Some('>') => {
+                        chars.next();
+                        ">>"
+                    }
+                    Some('|' | '&') => return None,
+                    _ => ">",
+                };
+                if found.is_some() || has_explicit_redirection_fd(command, index) {
+                    return None;
+                }
+                found = Some((index, operator));
+            }
+            _ => {}
+        }
+    }
+
+    let (operator_index, operator) = found?;
+    let command_prefix = command[..operator_index].trim();
+    let target_start = operator_index + operator.len();
+    let target = command[target_start..].trim();
+    if command_prefix.is_empty() || target.is_empty() {
+        return None;
+    }
+    Some(RedirectionSplit {
+        command: command_prefix,
+        operator,
+        target,
+    })
+}
+
+fn has_explicit_redirection_fd(command: &str, operator_index: usize) -> bool {
+    let before = &command[..operator_index];
+    let trimmed = before.trim_end_matches(|character: char| character.is_ascii_whitespace());
+    if trimmed.len() != before.len() {
+        return false;
+    }
+
+    let mut digit_start = trimmed.len();
+    for (index, character) in trimmed.char_indices().rev() {
+        if character.is_ascii_digit() {
+            digit_start = index;
+        } else {
+            break;
+        }
+    }
+    if digit_start == trimmed.len() {
+        return false;
+    }
+
+    trimmed[..digit_start]
+        .chars()
+        .next_back()
+        .is_none_or(|character| character.is_ascii_whitespace())
+}
+
+fn static_redirection_target(raw_target: &str) -> Option<String> {
+    if has_unsupported_redirection_target_meta(raw_target) {
+        return None;
+    }
+
+    let target = shlex::split(raw_target)?;
+    match target.as_slice() {
+        [target] if !target.is_empty() => Some(target.clone()),
+        _ => None,
+    }
+}
+
+fn has_unsupported_redirection_target_meta(value: &str) -> bool {
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    let mut word_start = true;
+
+    for character in value.chars() {
+        if escaped {
+            escaped = false;
+            word_start = false;
+            continue;
+        }
+        match character {
+            '\\' if !single_quoted => escaped = true,
+            '\'' if !double_quoted => {
+                single_quoted = !single_quoted;
+                word_start = false;
+            }
+            '"' if !single_quoted => {
+                double_quoted = !double_quoted;
+                word_start = false;
+            }
+            '$' | '`' if !single_quoted => return true,
+            '*' | '?' | '[' | '{' | '}' | '|' | '&' | ';' | '(' | ')' | '<' | '>'
+                if !single_quoted && !double_quoted =>
+            {
+                return true;
+            }
+            '~' if !single_quoted && !double_quoted && word_start => return true,
+            _ if !single_quoted && !double_quoted && character.is_ascii_whitespace() => {
+                word_start = true;
+            }
+            _ => word_start = false,
+        }
+    }
+
+    false
 }
 
 fn segment_words(segment: &ShellSegment) -> Vec<String> {
@@ -514,6 +695,43 @@ mod tests {
     }
 
     #[test]
+    fn stdout_redirections_decompose_after_literal_commands() {
+        assert_eq!(
+            unit_strings(&[
+                "bash",
+                "-c",
+                "printf hi > /tmp/out; git status >> '/tmp/status log'",
+            ]),
+            vec![
+                ShellCommandUnit::Parsed(vec!["printf".into(), "hi".into()]),
+                ShellCommandUnit::Redirection {
+                    operator: ">".into(),
+                    target: "/tmp/out".into(),
+                },
+                ShellCommandUnit::Parsed(vec!["git".into(), "status".into()]),
+                ShellCommandUnit::Redirection {
+                    operator: ">>".into(),
+                    target: "/tmp/status log".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn quoted_redirection_targets_can_contain_separator_characters() {
+        assert_eq!(
+            unit_strings(&["bash", "-c", "printf hi >> 'a;b|c&&d'"]),
+            vec![
+                ShellCommandUnit::Parsed(vec!["printf".into(), "hi".into()]),
+                ShellCommandUnit::Redirection {
+                    operator: ">>".into(),
+                    target: "a;b|c&&d".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn empty_payload_has_no_units() {
         assert_eq!(unit_strings(&["bash", "-c", ""]), Vec::new());
     }
@@ -532,7 +750,13 @@ mod tests {
     #[test]
     fn unsupported_fragments_become_opaque() {
         for script in [
-            "echo hi > file",
+            "echo hi > $OUT",
+            "echo hi > \"$OUT\"",
+            "echo hi > *.log",
+            "echo hi 2> file",
+            "echo hi >| file",
+            "echo hi &> file",
+            "echo hi > file extra",
             "echo $(date)",
             "echo $HOME",
             "echo {a,b}",

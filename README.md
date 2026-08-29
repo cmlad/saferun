@@ -63,11 +63,11 @@ Rules are shell-split with `shlex` and matched case-insensitively against argv:
 
 The `sed` rule above matches both `sed -n 1,20p` and `sed -n /start/,/end/p`; each `*` stays within one argv item. Quote rules containing `*` so YAML does not treat them as aliases.
 
-When a configured `shell_prefixes` rule leaves exactly one payload argument, `saferun` parses that payload and authorizes each top-level literal command joined by `|`, `&&`, or `;` in source order. It still executes the original shell argv unchanged, and only after every part is authorized. Quoted or escaped separators stay part of the surrounding argument.
+When a configured `shell_prefixes` rule leaves exactly one payload argument, `saferun` parses that payload and authorizes each top-level literal command joined by `|`, `&&`, or `;` in source order. Static stdout `>` and `>>` redirections at the end of a literal command are authorized as separate redirection parts, such as `> out.log` or `>> out.log`. It still executes the original shell argv unchanged, and only after every part is authorized. Quoted or escaped separators stay part of the surrounding argument.
 
-Unsupported shell syntax is not auto-allowed. Redirections, substitutions, variables, globs, `||`, backgrounding, newlines, assignments, control flow, grouping, functions, heredocs, malformed syntax, and shell invocations with extra argv are treated as opaque implicit asks. Opaque requests are sent to the approval UI as one quoted string, so a session grant applies to that exact fragment rather than to `bash` or `zsh` broadly.
+Unsupported shell syntax is not auto-allowed. Dynamic or unsupported redirection forms, substitutions, variables, globs, `||`, backgrounding, newlines, assignments, control flow, grouping, functions, heredocs, malformed syntax, and shell invocations with extra argv are treated as opaque implicit asks. Unsupported redirections include fd-specific redirects such as `2> file`, non-stdout operators such as `>|` or `&>`, input redirects, variable/substitution/glob targets, and redirections with non-target arguments after the target. Opaque requests are sent to the approval UI as one quoted string, so a session grant applies to that exact fragment rather than to `bash` or `zsh` broadly.
 
-Before any approval prompt, `saferun` checks the original invocation and all statically extracted commands, including commands inside opaque constructs, against `deny`. Any configured shell prefix found inside a parsed shell payload is denied without prompting.
+Before any approval prompt, `saferun` checks the original invocation and all statically extracted commands, including commands inside opaque constructs, against `deny`. Any attempt to run `saferun` from inside `saferun` is denied without prompting, including behind a recognized generic prefix. Any configured shell prefix found inside a parsed shell payload is also denied without prompting.
 
 ## Starting the Approver
 
@@ -95,7 +95,7 @@ The broker listens only on `/tmp/saferun-<effective-uid>/approval.sock`. Live `a
 
 The effective command is argv after stripping a recognized configured prefix. Approving the executable for `env X=1 python3 -c first` also approves `python3 -c second` and `env Y=2 python3 -c third`, but not `ruby -e …`.
 
-For parsed shell payloads, each component is approved independently. For `/bin/zsh -lc 'cargo test; git push origin main'`, a policy can allow `cargo test` while prompting for `git push origin main`; the shell command itself runs only if both parts are authorized.
+For parsed shell payloads, each component is approved independently. For `/bin/zsh -lc 'cargo test; git push origin main'`, a policy can allow `cargo test` while prompting for `git push origin main`; the shell command itself runs only if both parts are authorized. For `/bin/zsh -lc 'printf hi >> out.log'`, `printf hi` and `>> out.log` are approved separately.
 
 Session grants follow the agent token across working directories and equivalent config files. They are keyed by agent token, policy digest, and selected scope. `Allow all commands in this session` approves future approval prompts for the same agent token and current policy digest. A broker restart, key change, policy change, or cache eviction requires approval again.
 
@@ -193,6 +193,14 @@ For parsed shell payloads, `--dry-run` and `--explain` print each part before th
 PART 1/2 ALLOW cargo test (allow='cargo test')
 PART 2/2 ASK git push origin main (ask='git push **')
 ASK /bin/zsh -lc 'cargo test; git push origin main' (shell_parts=2)
+```
+
+Redirection parts appear in the same list:
+
+```text
+PART 1/2 ALLOW printf hi (allow='printf hi')
+PART 2/2 ASK >> out.log (ask='>> **')
+ASK /bin/zsh -lc 'printf hi >> out.log' (shell_parts=2)
 ```
 
 In a live `--explain` run, approved ask parts are reported as `ALLOW` with `approval='once'` or `approval='session'`, and the aggregate shell invocation is reported as `ALLOW` before execution.

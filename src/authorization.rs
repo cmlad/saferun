@@ -119,6 +119,15 @@ pub fn authorize_command<'a>(
     token: Option<&[u8; 32]>,
     client: &dyn ApprovalClient,
 ) -> AuthorizationOutcome<'a> {
+    if let Some(nested) = nested_saferun_command(policy, command) {
+        return AuthorizationOutcome::Denied {
+            diagnostic: Some(format!(
+                "saferun: nested saferun invocation is not permitted: {}",
+                crate::policy::shlex_join(&nested)
+            )),
+        };
+    }
+
     match classify(policy, command) {
         PolicyDecision::Deny => AuthorizationOutcome::Denied { diagnostic: None },
         PolicyDecision::Allow(matched) if dry_run => AuthorizationOutcome::DryRun {
@@ -192,15 +201,16 @@ fn authorize_shell_invocation<'a>(
     }
     let aggregate_kind = aggregate_kind(&classified);
 
-    if aggregate_kind == AuthorizationKind::Deny
-        || is_denied(policy, original_command)
-        || shell_invocation
-            .static_commands
-            .iter()
-            .any(|argv| denied(policy, argv))
+    if let Some(nested) = shell_invocation
+        .static_commands
+        .iter()
+        .find_map(|argv| nested_saferun_command(policy, argv))
     {
         return ShellAuthorizationOutcome::Denied {
-            diagnostic: None,
+            diagnostic: Some(format!(
+                "saferun: nested saferun invocation is not permitted: {}",
+                crate::policy::shlex_join(&nested)
+            )),
             units: classified,
         };
     }
@@ -215,6 +225,19 @@ fn authorize_shell_invocation<'a>(
                 "saferun: nested shell invocation is not permitted: {}",
                 crate::policy::shlex_join(&nested)
             )),
+            units: classified,
+        };
+    }
+
+    if aggregate_kind == AuthorizationKind::Deny
+        || is_denied(policy, original_command)
+        || shell_invocation
+            .static_commands
+            .iter()
+            .any(|argv| denied(policy, argv))
+    {
+        return ShellAuthorizationOutcome::Denied {
+            diagnostic: None,
             units: classified,
         };
     }
@@ -285,6 +308,17 @@ fn classify_unit<'a>(policy: &'a Policy, unit: ShellCommandUnit) -> ShellUnitAut
                 }
             }
         }
+        ShellCommandUnit::Redirection { .. } => {
+            let argv = unit.approval_command();
+            match classify(policy, &argv) {
+                PolicyDecision::Deny => (
+                    AuthorizationKind::Deny,
+                    policy_deny_match(policy, &argv).expect("denied command has a match"),
+                ),
+                PolicyDecision::Ask(matched) => (AuthorizationKind::Ask, matched),
+                PolicyDecision::Allow(matched) => (AuthorizationKind::Allow, matched),
+            }
+        }
         ShellCommandUnit::Opaque(_) => (AuthorizationKind::Ask, policy.implicit_ask_match()),
     };
 
@@ -298,6 +332,20 @@ fn classify_unit<'a>(policy: &'a Policy, unit: ShellCommandUnit) -> ShellUnitAut
 
 fn denied(policy: &Policy, argv: &[String]) -> bool {
     shell_deny_match(policy, argv).is_some()
+}
+
+fn nested_saferun_command(policy: &Policy, argv: &[String]) -> Option<Vec<String>> {
+    shell_prefix_candidates_for_shell_command(policy, argv)
+        .into_iter()
+        .find(|candidate| is_saferun_command(candidate))
+        .map(<[String]>::to_vec)
+}
+
+fn is_saferun_command(argv: &[String]) -> bool {
+    argv.first()
+        .and_then(|command| std::path::Path::new(command).file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "saferun")
 }
 
 fn shell_deny_match<'a>(policy: &'a Policy, argv: &[String]) -> Option<RuleMatch<'a>> {
@@ -574,6 +622,49 @@ mod tests {
     }
 
     #[test]
+    fn direct_nested_saferun_invocation_is_denied_before_policy_or_prompt() {
+        let (_directory, config, policy) = policy("allow:\n  - saferun **\nask:\n  - '**'\n");
+        let client = QueueClient::new([approved(ApprovalScope::Once)]);
+        let command = argv(&["saferun", "--dry-run", "--", "git", "status"]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[2; 32]), &client);
+
+        let InvocationAuthorizationOutcome::Direct(AuthorizationOutcome::Denied {
+            diagnostic: Some(message),
+        }) = outcome
+        else {
+            panic!("expected direct nested saferun denial");
+        };
+        assert_eq!(
+            message,
+            "saferun: nested saferun invocation is not permitted: saferun --dry-run -- git status"
+        );
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn direct_nested_saferun_after_generic_prefix_is_denied() {
+        let (_directory, config, policy) =
+            policy("prefixes: ['env *']\nallow:\n  - saferun **\nask:\n  - '**'\n");
+        let client = QueueClient::new([approved(ApprovalScope::Once)]);
+        let command = argv(&["env", "A=1", "saferun", "--dry-run", "--", "git", "status"]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[2; 32]), &client);
+
+        let InvocationAuthorizationOutcome::Direct(AuthorizationOutcome::Denied {
+            diagnostic: Some(message),
+        }) = outcome
+        else {
+            panic!("expected prefixed nested saferun denial");
+        };
+        assert_eq!(
+            message,
+            "saferun: nested saferun invocation is not permitted: saferun --dry-run -- git status"
+        );
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
     fn implicit_prefixed_ask_forwards_prefix_metadata() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("saferun.yaml");
@@ -712,6 +803,84 @@ mod tests {
             argv(&["git", "push", "origin", "main"])
         );
         assert_eq!(requests[1].command, argv(&["gh", "pr", "create", "--fill"]));
+    }
+
+    #[test]
+    fn shell_redirections_are_classified_as_independent_units() {
+        let (_directory, config, policy) = policy(
+            "shell_prefixes: ['bash -c']\nallow:\n  - printf hi\n  - git status\n  - '> out'\nask:\n  - '>> status.log'\n",
+        );
+        let client = QueueClient::new([Err("must not be called")]);
+        let command = argv(&["bash", "-c", "printf hi > out; git status >> status.log"]);
+        let outcome = authorize_invocation(&policy, &command, &config, true, None, &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::DryRun {
+            aggregate_kind,
+            units,
+        }) = outcome
+        else {
+            panic!("expected shell dry-run");
+        };
+        assert_eq!(aggregate_kind, AuthorizationKind::Ask);
+        assert_eq!(units.len(), 4);
+        assert_eq!(units[0].kind, AuthorizationKind::Allow);
+        assert_eq!(
+            units[0].unit,
+            ShellCommandUnit::Parsed(vec!["printf".into(), "hi".into()])
+        );
+        assert_eq!(units[1].kind, AuthorizationKind::Allow);
+        assert_eq!(
+            units[1].unit,
+            ShellCommandUnit::Redirection {
+                operator: ">".into(),
+                target: "out".into(),
+            }
+        );
+        assert_eq!(units[2].kind, AuthorizationKind::Allow);
+        assert_eq!(
+            units[2].unit,
+            ShellCommandUnit::Parsed(vec!["git".into(), "status".into()])
+        );
+        assert_eq!(units[3].kind, AuthorizationKind::Ask);
+        assert_eq!(
+            units[3].unit,
+            ShellCommandUnit::Redirection {
+                operator: ">>".into(),
+                target: "status.log".into(),
+            }
+        );
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn shell_redirection_asks_are_prompted_in_source_order() {
+        let (_directory, config, policy) = policy(
+            "shell_prefixes: ['bash -c']\nallow: [/bin/true]\nask:\n  - git push **\n  - '> out'\n",
+        );
+        let client = QueueClient::new([
+            approved(ApprovalScope::Once),
+            approved(ApprovalScope::Session),
+        ]);
+        let command = argv(&["bash", "-c", "git push origin main > out"]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[4; 32]), &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Execute {
+            aggregate_kind,
+            units,
+        }) = outcome
+        else {
+            panic!("expected shell execution");
+        };
+        assert_eq!(aggregate_kind, AuthorizationKind::Ask);
+        assert_eq!(units.len(), 2);
+        assert_eq!(client.calls.get(), 2);
+        let requests = client.requests.borrow();
+        assert_eq!(
+            requests[0].command,
+            argv(&["git", "push", "origin", "main"])
+        );
+        assert_eq!(requests[1].command, argv(&[">", "out"]));
     }
 
     #[test]
@@ -986,9 +1155,9 @@ mod tests {
     }
 
     #[test]
-    fn shell_opaque_unit_forces_exact_implicit_approval() {
+    fn shell_redirection_unit_forces_exact_implicit_approval() {
         let (_directory, config, policy) =
-            policy("shell_prefixes: ['bash -c']\nallow:\n  - echo **\nask:\n  - echo **\n");
+            policy("shell_prefixes: ['bash -c']\nallow:\n  - echo **\n");
         let client = QueueClient::new([approved(ApprovalScope::Session)]);
         let command = argv(&["bash", "-c", "echo hi > file"]);
         let outcome =
@@ -1003,7 +1172,7 @@ mod tests {
         ));
         assert_eq!(client.calls.get(), 1);
         let requests = client.requests.borrow();
-        assert_eq!(requests[0].command, vec!["'echo hi > file'".to_string()]);
+        assert_eq!(requests[0].command, argv(&[">", "file"]));
         assert!(requests[0].implicit_ask);
         assert_eq!(
             requests[0].ask_rule_source,
@@ -1030,6 +1199,53 @@ mod tests {
         assert_eq!(
             message,
             "saferun: nested shell invocation is not permitted: bash -c 'git status'"
+        );
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn nested_saferun_invocation_in_shell_payload_is_denied() {
+        let (_directory, config, policy) =
+            policy("shell_prefixes: ['bash -c']\nallow:\n  - saferun **\nask:\n  - '**'\n");
+        let client = QueueClient::new([approved(ApprovalScope::Once)]);
+        let command = argv(&["bash", "-c", "git status; saferun --dry-run -- git status"]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[8; 32]), &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
+            diagnostic: Some(message),
+            ..
+        }) = outcome
+        else {
+            panic!("expected nested saferun denial");
+        };
+        assert_eq!(
+            message,
+            "saferun: nested saferun invocation is not permitted: saferun --dry-run -- git status"
+        );
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn nested_saferun_invocation_after_generic_prefix_in_shell_payload_is_denied() {
+        let (_directory, config, policy) = policy(
+            "prefixes: ['env *']\nshell_prefixes: ['bash -c']\nallow:\n  - saferun **\nask:\n  - '**'\n",
+        );
+        let client = QueueClient::new([approved(ApprovalScope::Once)]);
+        let command = argv(&["bash", "-c", "env A=1 saferun --dry-run -- git status"]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[8; 32]), &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
+            diagnostic: Some(message),
+            ..
+        }) = outcome
+        else {
+            panic!("expected prefixed nested saferun denial");
+        };
+        assert_eq!(
+            message,
+            "saferun: nested saferun invocation is not permitted: saferun --dry-run -- git status"
         );
         assert_eq!(client.calls.get(), 0);
     }

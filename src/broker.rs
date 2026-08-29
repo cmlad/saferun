@@ -1054,6 +1054,38 @@ mod tests {
     }
 
     #[test]
+    fn matching_narrower_grant_refreshes_before_all_commands_grant() {
+        let base = request();
+        let all_key = SessionGrantKey::for_target(&base, SessionGrantTarget::AllCommands);
+        let prefix_key = SessionGrantKey::for_target(
+            &base,
+            SessionGrantTarget::EffectiveCommandPrefix(vec![base.command[0].clone()]),
+        );
+
+        let mut seeded = SessionCache::with_capacity(4);
+        assert!(seeded.insert(all_key.clone()));
+        assert!(seeded.insert(prefix_key.clone()));
+        let before_all = *seeded.grants.get(&all_key).expect("all grant");
+        let before_prefix = *seeded.grants.get(&prefix_key).expect("prefix grant");
+
+        let cache = Mutex::new(seeded);
+        assert_eq!(
+            lookup_session(&cache, &base),
+            Some(ApprovalDecision::Approved {
+                scope: ApprovalScope::Session
+            })
+        );
+        let cache = cache
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let after_all = *cache.grants.get(&all_key).expect("all grant");
+        let after_prefix = *cache.grants.get(&prefix_key).expect("prefix grant");
+
+        assert_eq!(after_all, before_all);
+        assert!(after_prefix > before_prefix);
+    }
+
+    #[test]
     fn executable_session_grant_follows_agent_across_directories_and_equivalent_configs() {
         let mut cache = SessionCache::with_capacity(4);
         let mut prompter = QueuePrompter::new([PromptChoice::AllowSession(

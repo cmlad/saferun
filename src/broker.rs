@@ -8,18 +8,21 @@ use std::io::{Read, Write};
 use std::sync::Mutex;
 
 const MAX_PROMPT_LEN: usize = 16 * 1024;
+const ALL_COMMANDS_SESSION_TITLE: &str = "Allow all commands in this session";
 
 /// The session scope a user selected on the approval panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionSelection {
     EffectiveCommandPrefix { parts: usize },
     MatchedAskRule,
+    AllCommands,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum SessionGrantTarget {
     EffectiveCommandPrefix(Vec<String>),
     MatchedAskRule(String),
+    AllCommands,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -48,10 +51,11 @@ fn effective_command(request: &ApprovalRequest) -> &[String] {
     request.command.get(consumed..).unwrap_or(&[])
 }
 
-/// Candidate grant keys for a request, longest effective prefix first.
+/// Candidate grant keys for a request: longest effective prefix first, then
+/// matched ask rule, then the blanket all-commands grant.
 fn session_probe_keys(request: &ApprovalRequest) -> Vec<SessionGrantKey> {
     let effective = effective_command(request);
-    let mut keys = Vec::with_capacity(effective.len() + 1);
+    let mut keys = Vec::with_capacity(effective.len() + 2);
     for parts in (1..=effective.len()).rev() {
         keys.push(SessionGrantKey::for_target(
             request,
@@ -64,6 +68,10 @@ fn session_probe_keys(request: &ApprovalRequest) -> Vec<SessionGrantKey> {
             SessionGrantTarget::MatchedAskRule(request.ask_rule_source.clone()),
         ));
     }
+    keys.push(SessionGrantKey::for_target(
+        request,
+        SessionGrantTarget::AllCommands,
+    ));
     keys
 }
 
@@ -92,6 +100,7 @@ fn session_grant_target(
                 ))
             }
         }
+        SessionSelection::AllCommands => Some(SessionGrantTarget::AllCommands),
     }
 }
 
@@ -432,7 +441,7 @@ struct SessionScopeOption {
 /// effective executable and therefore the default grant.
 fn session_scope_options(request: &ApprovalRequest) -> Vec<SessionScopeOption> {
     let effective = effective_command(request);
-    let mut options = Vec::with_capacity(effective.len() + 1);
+    let mut options = Vec::with_capacity(effective.len() + 2);
     for parts in 1..=effective.len() {
         options.push(SessionScopeOption {
             title: session_scope_title(&effective[..parts]),
@@ -445,6 +454,10 @@ fn session_scope_options(request: &ApprovalRequest) -> Vec<SessionScopeOption> {
             selection: SessionSelection::MatchedAskRule,
         });
     }
+    options.push(SessionScopeOption {
+        title: ALL_COMMANDS_SESSION_TITLE.to_string(),
+        selection: SessionSelection::AllCommands,
+    });
     options
 }
 
@@ -533,6 +546,7 @@ fn describe_target(target: &SessionGrantTarget) -> String {
             format!("prefix[{}]", parts.join(" "))
         }
         SessionGrantTarget::MatchedAskRule(source) => format!("rule[{source}]"),
+        SessionGrantTarget::AllCommands => "all-commands".to_string(),
     }
 }
 
@@ -755,9 +769,8 @@ mod tests {
     struct MemoryStream {
         input: Cursor<Vec<u8>>,
         output: Vec<u8>,
-        fail_writes: bool,
-        fail_write_pipe: bool,
-        fail_flush: bool,
+        write_failure: Option<io::ErrorKind>,
+        flush_failure: Option<io::ErrorKind>,
     }
 
     impl Read for MemoryStream {
@@ -768,13 +781,8 @@ mod tests {
 
     impl Write for MemoryStream {
         fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-            if self.fail_writes {
-                Err(io::Error::new(io::ErrorKind::Other, "injected failure"))
-            } else if self.fail_write_pipe {
-                Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "injected failure",
-                ))
+            if let Some(kind) = self.write_failure {
+                Err(io::Error::new(kind, "injected failure"))
             } else {
                 self.output.extend_from_slice(buffer);
                 Ok(buffer.len())
@@ -782,11 +790,8 @@ mod tests {
         }
 
         fn flush(&mut self) -> io::Result<()> {
-            if self.fail_flush {
-                Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "injected failure",
-                ))
+            if let Some(kind) = self.flush_failure {
+                Err(io::Error::new(kind, "injected failure"))
             } else {
                 Ok(())
             }
@@ -823,9 +828,8 @@ mod tests {
         let mut stream = MemoryStream {
             input: Cursor::new(input),
             output: Vec::new(),
-            fail_writes: false,
-            fail_write_pipe: false,
-            fail_flush: false,
+            write_failure: None,
+            flush_failure: None,
         };
         handle(&mut stream, cache, prompter).expect("handle request");
         read_response_frame(&mut Cursor::new(stream.output))
@@ -1021,6 +1025,35 @@ mod tests {
     }
 
     #[test]
+    fn all_commands_grant_approves_different_command_targets() {
+        let mut cache = SessionCache::with_capacity(4);
+        let mut prompter = QueuePrompter::new([
+            PromptChoice::AllowSession(SessionSelection::AllCommands),
+            PromptChoice::Deny,
+        ]);
+        let mut base = request();
+        base.command = vec!["python3".into(), "-c".into(), "first".into()];
+        base.ask_rule_source = "python3 **".into();
+        assert_eq!(
+            exchange(&base, &mut cache, &mut prompter),
+            ApprovalDecision::Approved {
+                scope: ApprovalScope::Session
+            }
+        );
+
+        let mut different_target = base.clone();
+        different_target.command = vec!["cargo".into(), "publish".into()];
+        different_target.ask_rule_source = "cargo publish **".to_string();
+        assert_eq!(
+            exchange(&different_target, &mut cache, &mut prompter),
+            ApprovalDecision::Approved {
+                scope: ApprovalScope::Session
+            }
+        );
+        assert_eq!(prompter.calls, 1);
+    }
+
+    #[test]
     fn executable_session_grant_follows_agent_across_directories_and_equivalent_configs() {
         let mut cache = SessionCache::with_capacity(4);
         let mut prompter = QueuePrompter::new([PromptChoice::AllowSession(
@@ -1091,6 +1124,84 @@ mod tests {
     }
 
     #[test]
+    fn all_commands_grant_isolated_by_token_and_policy() {
+        let mut cache = SessionCache::with_capacity(32);
+        let mut prompter = QueuePrompter::new(
+            [PromptChoice::AllowSession(SessionSelection::AllCommands)]
+                .into_iter()
+                .chain(std::iter::repeat_with(|| PromptChoice::Deny).take(2)),
+        );
+        let base = request();
+        assert_eq!(
+            exchange(&base, &mut cache, &mut prompter),
+            ApprovalDecision::Approved {
+                scope: ApprovalScope::Session
+            }
+        );
+
+        let mut token = base.clone();
+        token.session_digest = "c".repeat(64);
+        assert_eq!(
+            exchange(&token, &mut cache, &mut prompter),
+            ApprovalDecision::Denied
+        );
+
+        let mut policy = base;
+        policy.policy_digest = "d".repeat(64);
+        assert_eq!(
+            exchange(&policy, &mut cache, &mut prompter),
+            ApprovalDecision::Denied
+        );
+        assert_eq!(prompter.calls, 3);
+    }
+
+    #[test]
+    fn all_commands_grant_from_implicit_ask_covers_later_implicit_and_configured_asks() {
+        let mut cache = SessionCache::with_capacity(32);
+        let mut prompter = QueuePrompter::new([
+            PromptChoice::AllowSession(SessionSelection::AllCommands),
+            PromptChoice::Deny,
+        ]);
+        let mut consumed_all = request();
+        consumed_all.command = vec!["env".into(), "X=1".into()];
+        consumed_all.ask_rule_source = IMPLICIT_ASK_SOURCE.to_string();
+        consumed_all.implicit_ask = true;
+        consumed_all.prefix_rule_source = Some("env *".to_string());
+        consumed_all.prefix_parts_consumed = 2;
+        assert_eq!(
+            exchange(&consumed_all, &mut cache, &mut prompter),
+            ApprovalDecision::Approved {
+                scope: ApprovalScope::Session
+            }
+        );
+
+        let mut later_implicit = consumed_all.clone();
+        later_implicit.command = vec!["/unknown/tool".into(), "arg".into()];
+        later_implicit.prefix_rule_source = None;
+        later_implicit.prefix_parts_consumed = 0;
+        assert_eq!(
+            exchange(&later_implicit, &mut cache, &mut prompter),
+            ApprovalDecision::Approved {
+                scope: ApprovalScope::Session
+            }
+        );
+
+        let mut configured_ask = consumed_all;
+        configured_ask.command = vec!["/usr/bin/touch".into(), "/tmp/file".into()];
+        configured_ask.ask_rule_source = "/usr/bin/touch".to_string();
+        configured_ask.implicit_ask = false;
+        configured_ask.prefix_rule_source = None;
+        configured_ask.prefix_parts_consumed = 0;
+        assert_eq!(
+            exchange(&configured_ask, &mut cache, &mut prompter),
+            ApprovalDecision::Approved {
+                scope: ApprovalScope::Session
+            }
+        );
+        assert_eq!(prompter.calls, 1);
+    }
+
+    #[test]
     fn invalid_session_scopes_fail_closed_without_cache_entry() {
         let oversized = request();
         let mut zero = request();
@@ -1157,9 +1268,8 @@ mod tests {
         let mut stream = MemoryStream {
             input: Cursor::new(input),
             output: Vec::new(),
-            fail_writes: true,
-            fail_write_pipe: false,
-            fail_flush: false,
+            write_failure: Some(io::ErrorKind::Other),
+            flush_failure: None,
         };
         let mut cache = SessionCache::with_capacity(4);
         let mut prompter =
@@ -1181,9 +1291,8 @@ mod tests {
         let mut stream = MemoryStream {
             input: Cursor::new(input),
             output: Vec::new(),
-            fail_writes: false,
-            fail_write_pipe: false,
-            fail_flush: true,
+            write_failure: None,
+            flush_failure: Some(io::ErrorKind::BrokenPipe),
         };
         let mut cache = SessionCache::with_capacity(4);
         let mut prompter =
@@ -1204,15 +1313,76 @@ mod tests {
         let mut stream = MemoryStream {
             input: Cursor::new(input),
             output: Vec::new(),
-            fail_writes: false,
-            fail_write_pipe: true,
-            fail_flush: false,
+            write_failure: Some(io::ErrorKind::BrokenPipe),
+            flush_failure: None,
         };
         let mut cache = SessionCache::with_capacity(4);
         let mut prompter =
             QueuePrompter::new([PromptChoice::AllowSession(SessionSelection::MatchedAskRule)]);
         assert!(handle(&mut stream, &mut cache, &mut prompter).is_err());
         assert!(cache.grants.contains_key(&key));
+    }
+
+    #[test]
+    fn all_commands_response_write_failure_rolls_back_session_grant() {
+        let base = request();
+        let key = SessionGrantKey::for_target(&base, SessionGrantTarget::AllCommands);
+        let mut input = Vec::new();
+        write_request_frame(&mut input, &base).expect("frame request");
+        let mut stream = MemoryStream {
+            input: Cursor::new(input),
+            output: Vec::new(),
+            write_failure: Some(io::ErrorKind::Other),
+            flush_failure: None,
+        };
+        let mut cache = SessionCache::with_capacity(4);
+        let mut prompter =
+            QueuePrompter::new([PromptChoice::AllowSession(SessionSelection::AllCommands)]);
+        assert!(handle(&mut stream, &mut cache, &mut prompter).is_err());
+        assert!(!cache.grants.contains_key(&key));
+        assert!(cache.grants.is_empty());
+    }
+
+    #[test]
+    fn write_peer_closed_after_all_commands_session_keeps_grant() {
+        for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::ConnectionReset] {
+            let base = request();
+            let key = SessionGrantKey::for_target(&base, SessionGrantTarget::AllCommands);
+            let mut input = Vec::new();
+            write_request_frame(&mut input, &base).expect("frame request");
+            let mut stream = MemoryStream {
+                input: Cursor::new(input),
+                output: Vec::new(),
+                write_failure: Some(kind),
+                flush_failure: None,
+            };
+            let mut cache = SessionCache::with_capacity(4);
+            let mut prompter =
+                QueuePrompter::new([PromptChoice::AllowSession(SessionSelection::AllCommands)]);
+            assert!(handle(&mut stream, &mut cache, &mut prompter).is_err());
+            assert!(cache.grants.contains_key(&key));
+        }
+    }
+
+    #[test]
+    fn flush_peer_closed_after_all_commands_session_keeps_grant() {
+        for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::ConnectionReset] {
+            let base = request();
+            let key = SessionGrantKey::for_target(&base, SessionGrantTarget::AllCommands);
+            let mut input = Vec::new();
+            write_request_frame(&mut input, &base).expect("frame request");
+            let mut stream = MemoryStream {
+                input: Cursor::new(input),
+                output: Vec::new(),
+                write_failure: None,
+                flush_failure: Some(kind),
+            };
+            let mut cache = SessionCache::with_capacity(4);
+            let mut prompter =
+                QueuePrompter::new([PromptChoice::AllowSession(SessionSelection::AllCommands)]);
+            handle(&mut stream, &mut cache, &mut prompter).expect("delivered");
+            assert!(cache.grants.contains_key(&key));
+        }
     }
 
     #[test]
@@ -1348,6 +1518,10 @@ mod tests {
                     title: "Matched ask rule".to_string(),
                     selection: SessionSelection::MatchedAskRule,
                 },
+                SessionScopeOption {
+                    title: ALL_COMMANDS_SESSION_TITLE.to_string(),
+                    selection: SessionSelection::AllCommands,
+                },
             ]
         );
 
@@ -1363,6 +1537,10 @@ mod tests {
                 SessionScopeOption {
                     title: "Matched ask rule".to_string(),
                     selection: SessionSelection::MatchedAskRule,
+                },
+                SessionScopeOption {
+                    title: ALL_COMMANDS_SESSION_TITLE.to_string(),
+                    selection: SessionSelection::AllCommands,
                 },
             ]
         );
@@ -1384,7 +1562,13 @@ mod tests {
             .collect();
         assert_eq!(
             wrapped_titles,
-            ["python3", "python3 -c", "python3 -c x", "Matched ask rule",]
+            [
+                "python3",
+                "python3 -c",
+                "python3 -c x",
+                "Matched ask rule",
+                ALL_COMMANDS_SESSION_TITLE,
+            ]
         );
 
         let mut consumed_all = request();
@@ -1393,15 +1577,27 @@ mod tests {
         consumed_all.prefix_parts_consumed = 2;
         assert_eq!(
             session_scope_options(&consumed_all),
-            vec![SessionScopeOption {
-                title: "Matched ask rule".to_string(),
-                selection: SessionSelection::MatchedAskRule,
-            }]
+            vec![
+                SessionScopeOption {
+                    title: "Matched ask rule".to_string(),
+                    selection: SessionSelection::MatchedAskRule,
+                },
+                SessionScopeOption {
+                    title: ALL_COMMANDS_SESSION_TITLE.to_string(),
+                    selection: SessionSelection::AllCommands,
+                },
+            ]
         );
 
         consumed_all.ask_rule_source = IMPLICIT_ASK_SOURCE.to_string();
         consumed_all.implicit_ask = true;
-        assert!(session_scope_options(&consumed_all).is_empty());
+        assert_eq!(
+            session_scope_options(&consumed_all),
+            vec![SessionScopeOption {
+                title: ALL_COMMANDS_SESSION_TITLE.to_string(),
+                selection: SessionSelection::AllCommands,
+            }]
+        );
     }
 
     #[test]
@@ -1428,9 +1624,13 @@ mod tests {
                     title: "Matched ask rule".to_string(),
                     selection: SessionSelection::MatchedAskRule,
                 },
+                SessionScopeOption {
+                    title: ALL_COMMANDS_SESSION_TITLE.to_string(),
+                    selection: SessionSelection::AllCommands,
+                },
             ]
         );
-        assert_eq!(options.len(), 2);
+        assert_eq!(options.len(), 3);
     }
 
     #[test]
@@ -1466,11 +1666,15 @@ mod tests {
             parse_prompt_choice(b"Allow for session 2", &options),
             Ok(PromptChoice::AllowSession(SessionSelection::MatchedAskRule))
         );
+        assert_eq!(
+            parse_prompt_choice(b"Allow for session 3", &options),
+            Ok(PromptChoice::AllowSession(SessionSelection::AllCommands))
+        );
 
         for bad in [
             b"Allow for session\n".as_slice(),
             b"Allow for session \n".as_slice(),
-            b"Allow for session 3\n".as_slice(),
+            b"Allow for session 4\n".as_slice(),
             b"Allow for session 0x1\n".as_slice(),
             b"Allow for session -1\n".as_slice(),
         ] {

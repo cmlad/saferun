@@ -91,12 +91,13 @@ The broker listens only on `/tmp/saferun-<effective-uid>/approval.sock`. Live `a
 
 - every prefix of the effective command, starting with its executable
 - `Matched ask rule` for a configured `ask` match
+- `Allow all commands in this session`
 
 The effective command is argv after stripping a recognized configured prefix. Approving the executable for `env X=1 python3 -c first` also approves `python3 -c second` and `env Y=2 python3 -c third`, but not `ruby -e …`.
 
 For parsed shell payloads, each component is approved independently. For `/bin/zsh -lc 'cargo test; git push origin main'`, a policy can allow `cargo test` while prompting for `git push origin main`; the shell command itself runs only if both parts are authorized.
 
-Session grants follow the agent token across working directories and equivalent config files. They are keyed by agent token, policy digest, and selected scope. A broker restart, key change, policy change, or cache eviction requires approval again.
+Session grants follow the agent token across working directories and equivalent config files. They are keyed by agent token, policy digest, and selected scope. `Allow all commands in this session` approves future approval prompts for the same agent token and current policy digest. A broker restart, key change, policy change, or cache eviction requires approval again.
 
 ## AI Agent Setup
 

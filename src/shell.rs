@@ -44,11 +44,17 @@ pub fn analyze_shell_invocation(policy: &Policy, argv: &[String]) -> Option<Shel
         .get(shell_match.shell_parts_consumed..)
         .unwrap_or(&[]);
     let payload = remainder.first().map(String::as_str);
-    let parsed = payload.and_then(|script| parse_with_substitutions(script).ok());
+    let analysis_payload = payload
+        .map(|script| {
+            command_without_ignored_stderr_dev_null_redirections(script)
+                .unwrap_or_else(|| script.to_string())
+        })
+        .unwrap_or_default();
+    let parsed = parse_with_substitutions(&analysis_payload).ok();
     let static_commands = parsed.as_ref().map(static_commands).unwrap_or_default();
 
     let units = match remainder {
-        [script] => decompose_payload(script, parsed.as_ref()),
+        [script] => decompose_payload(script, &analysis_payload, parsed.as_ref()),
         [] => vec![ShellCommandUnit::Opaque(shlex_join(argv))],
         _ => vec![ShellCommandUnit::Opaque(shlex_join(argv))],
     };
@@ -137,10 +143,18 @@ fn push_assignment_stripped_candidate<'a>(
     }
 }
 
-fn decompose_payload(payload: &str, parsed: Option<&ParsedPipeline>) -> Vec<ShellCommandUnit> {
-    let trimmed = payload.trim();
+fn decompose_payload(
+    original_payload: &str,
+    analysis_payload: &str,
+    parsed: Option<&ParsedPipeline>,
+) -> Vec<ShellCommandUnit> {
+    let trimmed = original_payload.trim();
+    let analysis_trimmed = analysis_payload.trim();
     if trimmed.is_empty() {
         return Vec::new();
+    }
+    if analysis_trimmed.is_empty() {
+        return vec![opaque(trimmed)];
     }
 
     let Some(pipeline) = parsed else {
@@ -148,7 +162,7 @@ fn decompose_payload(payload: &str, parsed: Option<&ParsedPipeline>) -> Vec<Shel
     };
     if pipeline.has_parse_errors_recursive()
         || !has_only_supported_top_level_operators(pipeline)
-        || !matches_source_sequence(trimmed, pipeline)
+        || !matches_source_sequence(analysis_trimmed, pipeline)
     {
         return vec![opaque(trimmed)];
     }
@@ -166,23 +180,29 @@ fn units_from_segment(segment: &ShellSegment) -> Vec<ShellCommandUnit> {
         return Vec::new();
     }
 
-    if !has_literal_command_words(segment) {
+    let normalized_command = command_without_ignored_stderr_dev_null_redirections(command);
+    let analysis_command = normalized_command.as_deref().unwrap_or(command).trim();
+    if analysis_command.is_empty() {
+        return vec![opaque(command)];
+    }
+
+    if !has_literal_command_words(segment) && !has_literal_command_source_words(analysis_command) {
         return vec![opaque(command)];
     }
 
     if segment.redirection.is_none() {
-        if is_literal_simple_command_source(segment) {
-            if let Some(argv) = shlex::split(command) {
+        if is_literal_simple_command_source(analysis_command) {
+            if let Some(argv) = shlex::split(analysis_command) {
                 return vec![ShellCommandUnit::Parsed(argv)];
             }
         }
-        if let Some((argv, redirection)) = supported_static_redirection(segment) {
+        if let Some((argv, redirection)) = supported_static_redirection(segment, analysis_command) {
             return vec![ShellCommandUnit::Parsed(argv), redirection];
         }
         return vec![opaque(command)];
     }
 
-    if let Some((argv, redirection)) = supported_static_redirection(segment) {
+    if let Some((argv, redirection)) = supported_static_redirection(segment, analysis_command) {
         return vec![ShellCommandUnit::Parsed(argv), redirection];
     }
 
@@ -202,22 +222,35 @@ fn has_literal_command_words(segment: &ShellSegment) -> bool {
             .any(|word| word.is_assignment() || word.is_expansion())
 }
 
-fn is_literal_simple_command_source(segment: &ShellSegment) -> bool {
-    !has_unquoted_brace_expansion(segment.command.as_str())
-        && !has_unquoted_tilde_expansion(segment.command.as_str())
-        && !has_unquoted_glob(segment.command.as_str())
-        && !has_unquoted_redirection(segment.command.as_str())
+fn has_literal_command_source_words(command: &str) -> bool {
+    let Some(argv) = shlex::split(command) else {
+        return false;
+    };
+
+    !argv.is_empty()
+        && !argv.iter().any(|word| is_assignment(word))
+        && !has_unquoted_expansion(command)
 }
 
-fn supported_static_redirection(segment: &ShellSegment) -> Option<(Vec<String>, ShellCommandUnit)> {
-    if has_unquoted_brace_expansion(segment.command.as_str())
-        || has_unquoted_tilde_expansion(segment.command.as_str())
-        || has_unquoted_glob(segment.command.as_str())
+fn is_literal_simple_command_source(command: &str) -> bool {
+    !has_unquoted_brace_expansion(command)
+        && !has_unquoted_tilde_expansion(command)
+        && !has_unquoted_glob(command)
+        && !has_unquoted_redirection(command)
+}
+
+fn supported_static_redirection(
+    segment: &ShellSegment,
+    command: &str,
+) -> Option<(Vec<String>, ShellCommandUnit)> {
+    if has_unquoted_brace_expansion(command)
+        || has_unquoted_tilde_expansion(command)
+        || has_unquoted_glob(command)
     {
         return None;
     }
 
-    let split = split_supported_redirection_suffix(segment.command.trim())?;
+    let split = split_supported_redirection_suffix(command.trim())?;
     let argv = shlex::split(split.command)?;
     if argv.is_empty() {
         return None;
@@ -240,6 +273,159 @@ fn supported_static_redirection(segment: &ShellSegment) -> Option<(Vec<String>, 
             target,
         },
     ))
+}
+
+fn command_without_ignored_stderr_dev_null_redirections(command: &str) -> Option<String> {
+    let mut normalized = String::with_capacity(command.len());
+    let mut last_copied = 0;
+    let mut search_start = 0;
+    let mut removed = false;
+
+    while let Some(redirection) = next_ignored_stderr_dev_null_redirection(command, search_start) {
+        normalized.push_str(&command[last_copied..redirection.start]);
+        last_copied = redirection.end;
+        search_start = redirection.end;
+        removed = true;
+    }
+
+    if removed {
+        normalized.push_str(&command[last_copied..]);
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+struct IgnoredRedirection {
+    start: usize,
+    end: usize,
+}
+
+fn next_ignored_stderr_dev_null_redirection(
+    command: &str,
+    search_start: usize,
+) -> Option<IgnoredRedirection> {
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+
+    for (offset, character) in command[search_start..].char_indices() {
+        let index = search_start + offset;
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if !single_quoted => escaped = true,
+            '\'' if !double_quoted => single_quoted = !single_quoted,
+            '"' if !single_quoted => double_quoted = !double_quoted,
+            '>' if !single_quoted && !double_quoted => {
+                if matches!(command[index + 1..].chars().next(), Some('>' | '|' | '&')) {
+                    continue;
+                }
+                let Some((fd_start, fd)) = explicit_redirection_fd(command, index) else {
+                    continue;
+                };
+                if fd != "2" {
+                    continue;
+                }
+                let target_start = skip_horizontal_whitespace(command, index + 1);
+                let target_end = redirection_target_end(command, target_start)?;
+                let target = &command[target_start..target_end];
+                if static_redirection_target(target).as_deref() == Some("/dev/null") {
+                    return Some(IgnoredRedirection {
+                        start: fd_start,
+                        end: target_end,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn explicit_redirection_fd(command: &str, operator_index: usize) -> Option<(usize, &str)> {
+    let before = &command[..operator_index];
+    let trimmed = before.trim_end_matches(|character: char| character.is_ascii_whitespace());
+    if trimmed.len() != before.len() {
+        return None;
+    }
+
+    let mut digit_start = trimmed.len();
+    for (index, character) in trimmed.char_indices().rev() {
+        if character.is_ascii_digit() {
+            digit_start = index;
+        } else {
+            break;
+        }
+    }
+    if digit_start == trimmed.len() {
+        return None;
+    }
+    if !trimmed[..digit_start]
+        .chars()
+        .next_back()
+        .is_none_or(|character| character.is_ascii_whitespace())
+    {
+        return None;
+    }
+
+    Some((digit_start, &trimmed[digit_start..]))
+}
+
+fn skip_horizontal_whitespace(command: &str, mut index: usize) -> usize {
+    while let Some(character) = command[index..].chars().next() {
+        if !character.is_ascii_whitespace() || character == '\n' {
+            break;
+        }
+        index += character.len_utf8();
+    }
+    index
+}
+
+fn redirection_target_end(command: &str, target_start: usize) -> Option<usize> {
+    if target_start >= command.len() {
+        return None;
+    }
+
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    let mut saw_character = false;
+
+    for (offset, character) in command[target_start..].char_indices() {
+        let index = target_start + offset;
+        if escaped {
+            escaped = false;
+            saw_character = true;
+            continue;
+        }
+        match character {
+            '\\' if !single_quoted => {
+                escaped = true;
+                saw_character = true;
+            }
+            '\'' if !double_quoted => {
+                single_quoted = !single_quoted;
+                saw_character = true;
+            }
+            '"' if !single_quoted => {
+                double_quoted = !double_quoted;
+                saw_character = true;
+            }
+            _ if !single_quoted && !double_quoted && character.is_ascii_whitespace() => {
+                return saw_character.then_some(index);
+            }
+            '|' | '&' | ';' | '(' | ')' | '<' | '>' if !single_quoted && !double_quoted => {
+                return saw_character.then_some(index);
+            }
+            _ => saw_character = true,
+        }
+    }
+
+    saw_character.then_some(command.len())
 }
 
 struct RedirectionSplit<'a> {
@@ -301,28 +487,7 @@ fn split_supported_redirection_suffix(command: &str) -> Option<RedirectionSplit<
 }
 
 fn has_explicit_redirection_fd(command: &str, operator_index: usize) -> bool {
-    let before = &command[..operator_index];
-    let trimmed = before.trim_end_matches(|character: char| character.is_ascii_whitespace());
-    if trimmed.len() != before.len() {
-        return false;
-    }
-
-    let mut digit_start = trimmed.len();
-    for (index, character) in trimmed.char_indices().rev() {
-        if character.is_ascii_digit() {
-            digit_start = index;
-        } else {
-            break;
-        }
-    }
-    if digit_start == trimmed.len() {
-        return false;
-    }
-
-    trimmed[..digit_start]
-        .chars()
-        .next_back()
-        .is_none_or(|character| character.is_ascii_whitespace())
+    explicit_redirection_fd(command, operator_index).is_some()
 }
 
 fn static_redirection_target(raw_target: &str) -> Option<String> {
@@ -447,6 +612,10 @@ fn has_unquoted_glob(value: &str) -> bool {
 
 fn has_unquoted_redirection(value: &str) -> bool {
     has_unquoted_meta(value, &['<', '>'])
+}
+
+fn has_unquoted_expansion(value: &str) -> bool {
+    has_unquoted_meta(value, &['$', '`'])
 }
 
 pub(crate) fn strip_leading_assignments(argv: &[String]) -> Option<&[String]> {
@@ -750,6 +919,56 @@ mod tests {
     }
 
     #[test]
+    fn stderr_dev_null_redirections_are_ignored_after_literal_commands() {
+        assert_eq!(
+            unit_strings(&[
+                "bash",
+                "-c",
+                "printf hi 2>/dev/null; printf bye 2> /dev/null"
+            ]),
+            vec![
+                ShellCommandUnit::Parsed(vec!["printf".into(), "hi".into()]),
+                ShellCommandUnit::Parsed(vec!["printf".into(), "bye".into()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn stderr_dev_null_redirections_can_appear_around_arguments() {
+        assert_eq!(
+            unit_strings(&["bash", "-c", "2>/dev/null printf hi 2> '/dev/null' bye"]),
+            vec![ShellCommandUnit::Parsed(vec![
+                "printf".into(),
+                "hi".into(),
+                "bye".into()
+            ])]
+        );
+    }
+
+    #[test]
+    fn stderr_dev_null_redirections_compose_with_stdout_redirection_parts() {
+        assert_eq!(
+            unit_strings(&[
+                "bash",
+                "-c",
+                "printf hi 2>/dev/null > out; printf bye >> out 2> /dev/null"
+            ]),
+            vec![
+                ShellCommandUnit::Parsed(vec!["printf".into(), "hi".into()]),
+                ShellCommandUnit::Redirection {
+                    operator: ">".into(),
+                    target: "out".into(),
+                },
+                ShellCommandUnit::Parsed(vec!["printf".into(), "bye".into()]),
+                ShellCommandUnit::Redirection {
+                    operator: ">>".into(),
+                    target: "out".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn quoted_redirection_targets_can_contain_separator_characters() {
         assert_eq!(
             unit_strings(&["bash", "-c", "printf hi >> 'a;b|c&&d'"]),
@@ -786,7 +1005,14 @@ mod tests {
             "echo hi > \"$OUT\"",
             "echo hi > *.log",
             "echo hi 2> file",
-            "echo hi 2> /dev/null",
+            "echo hi 2>> /dev/null",
+            "echo hi 2>/tmp/null",
+            "echo hi 2>/dev/nullish",
+            "echo hi 20>/dev/null",
+            "echo hi 2>&1",
+            "echo hi 2> $NULL",
+            "echo hi 2> \"$NULL\"",
+            "echo hi 2>",
             "echo hi >| file",
             "echo hi &> file",
             "echo hi &> /dev/null",

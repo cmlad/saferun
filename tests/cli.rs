@@ -267,6 +267,63 @@ fn shell_dry_run_prints_dev_null_redirection_part() {
 }
 
 #[test]
+fn shell_dry_run_omits_stderr_dev_null_redirection_part() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = temp.path().join("saferun.yaml");
+    std::fs::write(
+        &config,
+        "shell_prefixes: ['bash -c']\nallow:\n  - printf hi\n  - grep h\nask:\n  - '2> /dev/null'\n",
+    )
+    .expect("write config");
+    let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
+        .args(["--config"])
+        .arg(&config)
+        .args([
+            "--dry-run",
+            "--",
+            "bash",
+            "-c",
+            "printf hi 2>/dev/null | grep h 2> /dev/null",
+        ])
+        .output()
+        .expect("run saferun");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"PART 1/2 ALLOW printf hi (allow='printf hi')\n\
+          PART 2/2 ALLOW grep h (allow='grep h')\n\
+          ALLOW bash -c 'printf hi 2>/dev/null | grep h 2> /dev/null' (shell_parts=2)\n"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
+fn shell_dry_run_keeps_near_miss_stderr_dev_null_redirection_opaque() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = temp.path().join("saferun.yaml");
+    std::fs::write(
+        &config,
+        "shell_prefixes: ['bash -c']\nallow:\n  - printf hi\nask:\n  - '**'\n",
+    )
+    .expect("write config");
+    let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
+        .args(["--config"])
+        .arg(&config)
+        .args(["--dry-run", "--", "bash", "-c", "printf hi 2>>/dev/null"])
+        .output()
+        .expect("run saferun");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"PART 1/1 ASK 'printf hi 2>>/dev/null' (ask='<no matched rule>')\n\
+          ASK bash -c 'printf hi 2>>/dev/null' (shell_parts=1)\n"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
 fn shell_dry_run_prints_parts_inside_outer_generic_prefix() {
     let temp = tempfile::tempdir().expect("tempdir");
     let config = temp.path().join("saferun.yaml");
@@ -472,6 +529,32 @@ fn shell_invocation_executes_original_command_after_parts_are_allowed() {
 
     assert!(output.status.success(), "{output:?}");
     assert_eq!(output.stdout, b"okdone");
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
+fn shell_invocation_executes_original_stderr_dev_null_redirection_after_parts_are_allowed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = temp.path().join("saferun.yaml");
+    std::fs::write(
+        &config,
+        "shell_prefixes: ['/bin/bash -c']\nallow:\n  - \"/bin/sh -c 'printf err >&2'\"\n  - printf ok\n",
+    )
+    .expect("write config");
+    let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
+        .args(["--config"])
+        .arg(&config)
+        .args([
+            "--",
+            "/bin/bash",
+            "-c",
+            "/bin/sh -c 'printf err >&2' 2>/dev/null; printf ok",
+        ])
+        .output()
+        .expect("run saferun");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"ok");
     assert!(output.stderr.is_empty(), "{output:?}");
 }
 

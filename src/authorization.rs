@@ -893,6 +893,53 @@ mod tests {
     }
 
     #[test]
+    fn shell_ignores_separator_adjacent_stderr_dev_null_without_prompting() {
+        let (_directory, config, policy) = policy(
+            "shell_prefixes: ['bash -c']\nallow:\n  - printf hi\n  - printf bye\n  - grep bye\n  - cargo test\nask:\n  - '2> /dev/null'\n",
+        );
+        let client = QueueClient::new([Err("must not be called")]);
+        let command = argv(&[
+            "bash",
+            "-c",
+            "printf hi;2>/dev/null printf bye|2>/dev/null grep bye&&2> /dev/null cargo test",
+        ]);
+        let outcome = authorize_invocation(&policy, &command, &config, false, None, &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Execute {
+            aggregate_kind,
+            units,
+        }) = outcome
+        else {
+            panic!("expected shell execution");
+        };
+        assert_eq!(aggregate_kind, AuthorizationKind::Allow);
+        assert_eq!(units.len(), 4);
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn shell_quoted_expansions_with_ignored_stderr_dev_null_do_not_match_allow() {
+        let (_directory, config, policy) =
+            policy("shell_prefixes: ['bash -c']\nallow:\n  - echo **\nask:\n  - git push **\n");
+        let client = QueueClient::new([Err("must not be called")]);
+        let command = argv(&["bash", "-c", "echo \"$HOME\" 2>/dev/null"]);
+        let outcome = authorize_invocation(&policy, &command, &config, true, None, &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::DryRun {
+            aggregate_kind,
+            units,
+        }) = outcome
+        else {
+            panic!("expected shell dry-run");
+        };
+        assert_eq!(aggregate_kind, AuthorizationKind::Ask);
+        assert_eq!(units.len(), 1);
+        assert!(matches!(units[0].unit, ShellCommandUnit::Opaque(_)));
+        assert!(units[0].matched.is_implicit());
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
     fn shell_ignores_stderr_dev_null_only_payload_without_prompting() {
         let (_directory, config, policy) =
             policy("shell_prefixes: ['bash -c']\nallow: [/bin/true]\nask: ['**']\n");

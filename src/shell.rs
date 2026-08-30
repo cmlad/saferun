@@ -209,7 +209,7 @@ fn units_from_segment(segment: &ShellSegment) -> Vec<ShellCommandUnit> {
         return vec![opaque(command)];
     }
 
-    if !has_literal_command_words(segment) && !has_literal_command_source_words(analysis_command) {
+    if !has_literal_command_words(segment) {
         return vec![opaque(command)];
     }
 
@@ -243,16 +243,6 @@ fn has_literal_command_words(segment: &ShellSegment) -> bool {
             .words
             .iter()
             .any(|word| word.is_assignment() || word.is_expansion())
-}
-
-fn has_literal_command_source_words(command: &str) -> bool {
-    let Some(argv) = shlex::split(command) else {
-        return false;
-    };
-
-    !argv.is_empty()
-        && !argv.iter().any(|word| is_assignment(word))
-        && !has_unquoted_expansion(command)
 }
 
 fn is_literal_simple_command_source(command: &str) -> bool {
@@ -387,15 +377,29 @@ fn explicit_redirection_fd(command: &str, operator_index: usize) -> Option<(usiz
     if digit_start == trimmed.len() {
         return None;
     }
-    if !trimmed[..digit_start]
-        .chars()
-        .next_back()
-        .is_none_or(|character| character.is_ascii_whitespace())
-    {
+    if !has_redirection_fd_boundary(&trimmed[..digit_start]) {
         return None;
     }
 
     Some((digit_start, &trimmed[digit_start..]))
+}
+
+fn has_redirection_fd_boundary(before_fd: &str) -> bool {
+    let Some(previous) = before_fd.chars().next_back() else {
+        return true;
+    };
+    if is_shell_blank(previous) || matches!(previous, ';' | '|') {
+        return true;
+    }
+    if previous != '&' {
+        return false;
+    }
+
+    before_fd
+        .chars()
+        .rev()
+        .nth(1)
+        .is_some_and(|character| character == '&')
 }
 
 fn skip_horizontal_whitespace(command: &str, mut index: usize) -> usize {
@@ -653,10 +657,6 @@ fn has_unquoted_glob(value: &str) -> bool {
 
 fn has_unquoted_redirection(value: &str) -> bool {
     has_unquoted_meta(value, &['<', '>'])
-}
-
-fn has_unquoted_expansion(value: &str) -> bool {
-    has_unquoted_meta(value, &['$', '`'])
 }
 
 pub(crate) fn strip_leading_assignments(argv: &[String]) -> Option<&[String]> {
@@ -987,6 +987,23 @@ mod tests {
     }
 
     #[test]
+    fn stderr_dev_null_redirections_can_start_commands_after_supported_operators() {
+        assert_eq!(
+            unit_strings(&[
+                "bash",
+                "-c",
+                "printf hi;2>/dev/null printf bye|2>/dev/null grep bye&&2> /dev/null cargo test"
+            ]),
+            vec![
+                ShellCommandUnit::Parsed(vec!["printf".into(), "hi".into()]),
+                ShellCommandUnit::Parsed(vec!["printf".into(), "bye".into()]),
+                ShellCommandUnit::Parsed(vec!["grep".into(), "bye".into()]),
+                ShellCommandUnit::Parsed(vec!["cargo".into(), "test".into()]),
+            ]
+        );
+    }
+
+    #[test]
     fn stderr_dev_null_redirections_compose_with_stdout_redirection_parts() {
         assert_eq!(
             unit_strings(&[
@@ -1016,6 +1033,23 @@ mod tests {
             unit_strings(&["bash", "-c", "2>/dev/null; 2> /dev/null;"]),
             Vec::new()
         );
+    }
+
+    #[test]
+    fn quoted_expansions_with_ignored_stderr_dev_null_stay_opaque() {
+        for script in [
+            "echo \"$HOME\" 2>/dev/null",
+            "echo \"${VAR}\" 2>/dev/null",
+            "echo \"$(date)\" 2>/dev/null",
+            "echo \"$((1 + 2))\" 2>/dev/null",
+        ] {
+            let units = unit_strings(&["bash", "-c", script]);
+            assert_eq!(units.len(), 1, "{script:?}");
+            assert!(
+                matches!(units[0], ShellCommandUnit::Opaque(_)),
+                "{script:?}: {units:?}"
+            );
+        }
     }
 
     #[test]

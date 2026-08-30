@@ -893,6 +893,26 @@ mod tests {
     }
 
     #[test]
+    fn shell_ignores_stderr_dev_null_only_payload_without_prompting() {
+        let (_directory, config, policy) =
+            policy("shell_prefixes: ['bash -c']\nallow: [/bin/true]\nask: ['**']\n");
+        let client = QueueClient::new([Err("must not be called")]);
+        let command = argv(&["bash", "-c", "2>/dev/null"]);
+        let outcome = authorize_invocation(&policy, &command, &config, false, None, &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Execute {
+            aggregate_kind,
+            units,
+        }) = outcome
+        else {
+            panic!("expected shell execution");
+        };
+        assert_eq!(aggregate_kind, AuthorizationKind::Allow);
+        assert!(units.is_empty());
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
     fn shell_empty_payload_authorizes_without_prompting() {
         let (_directory, config, policy) =
             policy("shell_prefixes: ['bash -c']\nallow: [/bin/true]\nask: ['**']\n");

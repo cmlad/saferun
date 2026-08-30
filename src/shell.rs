@@ -44,17 +44,24 @@ pub fn analyze_shell_invocation(policy: &Policy, argv: &[String]) -> Option<Shel
         .get(shell_match.shell_parts_consumed..)
         .unwrap_or(&[]);
     let payload = remainder.first().map(String::as_str);
-    let analysis_payload = payload
-        .map(|script| {
-            command_without_ignored_stderr_dev_null_redirections(script)
-                .unwrap_or_else(|| script.to_string())
-        })
+    let (analysis_payload, removed_ignored_redirects) = payload
+        .map(
+            |script| match command_without_ignored_stderr_dev_null_redirections(script) {
+                Some(normalized) => (normalized, true),
+                None => (script.to_string(), false),
+            },
+        )
         .unwrap_or_default();
     let parsed = parse_with_substitutions(&analysis_payload).ok();
     let static_commands = parsed.as_ref().map(static_commands).unwrap_or_default();
 
     let units = match remainder {
-        [script] => decompose_payload(script, &analysis_payload, parsed.as_ref()),
+        [script] => decompose_payload(
+            script,
+            &analysis_payload,
+            removed_ignored_redirects,
+            parsed.as_ref(),
+        ),
         [] => vec![ShellCommandUnit::Opaque(shlex_join(argv))],
         _ => vec![ShellCommandUnit::Opaque(shlex_join(argv))],
     };
@@ -146,11 +153,21 @@ fn push_assignment_stripped_candidate<'a>(
 fn decompose_payload(
     original_payload: &str,
     analysis_payload: &str,
+    removed_ignored_redirects: bool,
     parsed: Option<&ParsedPipeline>,
 ) -> Vec<ShellCommandUnit> {
     let trimmed = original_payload.trim();
     let analysis_trimmed = analysis_payload.trim();
     if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if has_unsupported_shell_analysis_whitespace(original_payload) {
+        return vec![opaque(trimmed)];
+    }
+    if removed_ignored_redirects
+        && (analysis_trimmed.is_empty()
+            || contains_only_ignored_redirection_separators(analysis_trimmed))
+    {
         return Vec::new();
     }
     if analysis_trimmed.is_empty() {
@@ -172,6 +189,12 @@ fn decompose_payload(
         .iter()
         .flat_map(units_from_segment)
         .collect()
+}
+
+fn contains_only_ignored_redirection_separators(value: &str) -> bool {
+    value
+        .chars()
+        .all(|character| is_shell_blank(character) || character == ';')
 }
 
 fn units_from_segment(segment: &ShellSegment) -> Vec<ShellCommandUnit> {
@@ -377,7 +400,7 @@ fn explicit_redirection_fd(command: &str, operator_index: usize) -> Option<(usiz
 
 fn skip_horizontal_whitespace(command: &str, mut index: usize) -> usize {
     while let Some(character) = command[index..].chars().next() {
-        if !character.is_ascii_whitespace() || character == '\n' {
+        if !is_shell_blank(character) {
             break;
         }
         index += character.len_utf8();
@@ -415,7 +438,7 @@ fn redirection_target_end(command: &str, target_start: usize) -> Option<usize> {
                 double_quoted = !double_quoted;
                 saw_character = true;
             }
-            _ if !single_quoted && !double_quoted && character.is_ascii_whitespace() => {
+            _ if !single_quoted && !double_quoted && is_shell_blank(character) => {
                 return saw_character.then_some(index);
             }
             '|' | '&' | ';' | '(' | ')' | '<' | '>' if !single_quoted && !double_quoted => {
@@ -531,7 +554,13 @@ fn has_unsupported_redirection_target_meta(value: &str) -> bool {
                 return true;
             }
             '~' if !single_quoted && !double_quoted && word_start => return true,
-            _ if !single_quoted && !double_quoted && character.is_ascii_whitespace() => {
+            _ if !single_quoted
+                && !double_quoted
+                && is_unsupported_shell_analysis_whitespace(character) =>
+            {
+                return true;
+            }
+            _ if !single_quoted && !double_quoted && is_shell_blank(character) => {
                 word_start = true;
             }
             _ => word_start = false,
@@ -539,6 +568,18 @@ fn has_unsupported_redirection_target_meta(value: &str) -> bool {
     }
 
     false
+}
+
+fn is_shell_blank(character: char) -> bool {
+    matches!(character, ' ' | '\t')
+}
+
+fn has_unsupported_shell_analysis_whitespace(value: &str) -> bool {
+    value.chars().any(is_unsupported_shell_analysis_whitespace)
+}
+
+fn is_unsupported_shell_analysis_whitespace(character: char) -> bool {
+    character.is_ascii_whitespace() && !is_shell_blank(character) && character != '\n'
 }
 
 fn segment_words(segment: &ShellSegment) -> Vec<String> {
@@ -969,6 +1010,15 @@ mod tests {
     }
 
     #[test]
+    fn stderr_dev_null_only_payloads_have_no_authorization_units() {
+        assert_eq!(unit_strings(&["bash", "-c", "2>/dev/null"]), Vec::new());
+        assert_eq!(
+            unit_strings(&["bash", "-c", "2>/dev/null; 2> /dev/null;"]),
+            Vec::new()
+        );
+    }
+
+    #[test]
     fn quoted_redirection_targets_can_contain_separator_characters() {
         assert_eq!(
             unit_strings(&["bash", "-c", "printf hi >> 'a;b|c&&d'"]),
@@ -1012,6 +1062,10 @@ mod tests {
             "echo hi 2>&1",
             "echo hi 2> $NULL",
             "echo hi 2> \"$NULL\"",
+            "echo hi 2>\r/dev/null",
+            "echo hi 2>\x0b/dev/null",
+            "echo hi 2>\x0c/dev/null",
+            "echo hi 2>/dev/null\r",
             "echo hi 2>",
             "echo hi >| file",
             "echo hi &> file",

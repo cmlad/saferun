@@ -46,7 +46,7 @@ pub fn analyze_shell_invocation(policy: &Policy, argv: &[String]) -> Option<Shel
     let payload = remainder.first().map(String::as_str);
     let (analysis_payload, removed_ignored_redirects) = payload
         .map(
-            |script| match command_without_ignored_stderr_dev_null_redirections(script) {
+            |script| match command_without_ignored_authorization_redirections(script) {
                 Some(normalized) => (normalized, true),
                 None => (script.to_string(), false),
             },
@@ -203,7 +203,7 @@ fn units_from_segment(segment: &ShellSegment) -> Vec<ShellCommandUnit> {
         return Vec::new();
     }
 
-    let normalized_command = command_without_ignored_stderr_dev_null_redirections(command);
+    let normalized_command = command_without_ignored_authorization_redirections(command);
     let analysis_command = normalized_command.as_deref().unwrap_or(command).trim();
     if analysis_command.is_empty() {
         return vec![opaque(command)];
@@ -284,13 +284,13 @@ fn supported_static_redirection(
     ))
 }
 
-fn command_without_ignored_stderr_dev_null_redirections(command: &str) -> Option<String> {
+fn command_without_ignored_authorization_redirections(command: &str) -> Option<String> {
     let mut normalized = String::with_capacity(command.len());
     let mut last_copied = 0;
     let mut search_start = 0;
     let mut removed = false;
 
-    while let Some(redirection) = next_ignored_stderr_dev_null_redirection(command, search_start) {
+    while let Some(redirection) = next_ignored_authorization_redirection(command, search_start) {
         normalized.push_str(&command[last_copied..redirection.start]);
         last_copied = redirection.end;
         search_start = redirection.end;
@@ -310,7 +310,7 @@ struct IgnoredRedirection {
     end: usize,
 }
 
-fn next_ignored_stderr_dev_null_redirection(
+fn next_ignored_authorization_redirection(
     command: &str,
     search_start: usize,
 ) -> Option<IgnoredRedirection> {
@@ -329,23 +329,35 @@ fn next_ignored_stderr_dev_null_redirection(
             '\'' if !double_quoted => single_quoted = !single_quoted,
             '"' if !single_quoted => double_quoted = !double_quoted,
             '>' if !single_quoted && !double_quoted => {
-                if matches!(command[index + 1..].chars().next(), Some('>' | '|' | '&')) {
-                    continue;
-                }
                 let Some((fd_start, fd)) = explicit_redirection_fd(command, index) else {
                     continue;
                 };
                 if fd != "2" {
                     continue;
                 }
-                let target_start = skip_horizontal_whitespace(command, index + 1);
-                let target_end = redirection_target_end(command, target_start)?;
-                let target = &command[target_start..target_end];
-                if static_redirection_target(target).as_deref() == Some("/dev/null") {
-                    return Some(IgnoredRedirection {
-                        start: fd_start,
-                        end: target_end,
-                    });
+                match command[index + 1..].chars().next() {
+                    Some('&') => {
+                        let target_start = skip_horizontal_whitespace(command, index + 2);
+                        let target_end = redirection_target_end(command, target_start)?;
+                        if &command[target_start..target_end] == "1" {
+                            return Some(IgnoredRedirection {
+                                start: fd_start,
+                                end: target_end,
+                            });
+                        }
+                    }
+                    Some('>' | '|') => continue,
+                    _ => {
+                        let target_start = skip_horizontal_whitespace(command, index + 1);
+                        let target_end = redirection_target_end(command, target_start)?;
+                        let target = &command[target_start..target_end];
+                        if static_redirection_target(target).as_deref() == Some("/dev/null") {
+                            return Some(IgnoredRedirection {
+                                start: fd_start,
+                                end: target_end,
+                            });
+                        }
+                    }
                 }
             }
             _ => {}
@@ -1127,6 +1139,17 @@ mod tests {
     }
 
     #[test]
+    fn stderr_stdout_duplications_are_ignored_after_literal_commands() {
+        assert_eq!(
+            unit_strings(&["bash", "-c", "printf hi 2>&1; printf bye 2>&\t1"]),
+            vec![
+                ShellCommandUnit::Parsed(vec!["printf".into(), "hi".into()]),
+                ShellCommandUnit::Parsed(vec!["printf".into(), "bye".into()]),
+            ]
+        );
+    }
+
+    #[test]
     fn tilde_forms_compose_with_supported_operators_and_ignored_stderr() {
         assert_eq!(
             unit_strings(&[
@@ -1172,6 +1195,23 @@ mod tests {
     }
 
     #[test]
+    fn stderr_stdout_duplications_can_start_commands_after_supported_operators() {
+        assert_eq!(
+            unit_strings(&[
+                "bash",
+                "-c",
+                "printf hi;2>&1 printf bye|2>&1 grep bye&&2>& 1 cargo test"
+            ]),
+            vec![
+                ShellCommandUnit::Parsed(vec!["printf".into(), "hi".into()]),
+                ShellCommandUnit::Parsed(vec!["printf".into(), "bye".into()]),
+                ShellCommandUnit::Parsed(vec!["grep".into(), "bye".into()]),
+                ShellCommandUnit::Parsed(vec!["cargo".into(), "test".into()]),
+            ]
+        );
+    }
+
+    #[test]
     fn stderr_dev_null_redirections_compose_with_stdout_redirection_parts() {
         assert_eq!(
             unit_strings(&[
@@ -1195,11 +1235,67 @@ mod tests {
     }
 
     #[test]
+    fn stderr_stdout_duplications_compose_with_stdout_redirection_parts() {
+        assert_eq!(
+            unit_strings(&[
+                "bash",
+                "-c",
+                concat!(
+                    "printf hi > out 2>&1; ",
+                    "printf bye 2>&1 >> out; ",
+                    "printf ok 2>& 1 > out2; ",
+                    "printf last >> out3 2>& 1",
+                ),
+            ]),
+            vec![
+                ShellCommandUnit::Parsed(vec!["printf".into(), "hi".into()]),
+                ShellCommandUnit::Redirection {
+                    operator: ">".into(),
+                    target: "out".into(),
+                },
+                ShellCommandUnit::Parsed(vec!["printf".into(), "bye".into()]),
+                ShellCommandUnit::Redirection {
+                    operator: ">>".into(),
+                    target: "out".into(),
+                },
+                ShellCommandUnit::Parsed(vec!["printf".into(), "ok".into()]),
+                ShellCommandUnit::Redirection {
+                    operator: ">".into(),
+                    target: "out2".into(),
+                },
+                ShellCommandUnit::Parsed(vec!["printf".into(), "last".into()]),
+                ShellCommandUnit::Redirection {
+                    operator: ">>".into(),
+                    target: "out3".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn stderr_dev_null_only_payloads_have_no_authorization_units() {
         assert_eq!(unit_strings(&["bash", "-c", "2>/dev/null"]), Vec::new());
         assert_eq!(
             unit_strings(&["bash", "-c", "2>/dev/null; 2> /dev/null;"]),
             Vec::new()
+        );
+    }
+
+    #[test]
+    fn stderr_stdout_duplication_only_payloads_have_no_authorization_units() {
+        assert_eq!(unit_strings(&["bash", "-c", "2>&1"]), Vec::new());
+        assert_eq!(unit_strings(&["bash", "-c", "2>&1; 2>& 1;"]), Vec::new());
+    }
+
+    #[test]
+    fn quoted_or_escaped_stderr_stdout_duplication_text_stays_literal() {
+        assert_eq!(
+            unit_strings(&["bash", "-c", r#"printf '2>&1' 2\>\&1"#]),
+            vec![ShellCommandUnit::Parsed(vec![
+                "printf".into(),
+                "2>&1".into(),
+                "2>&1".into(),
+            ])]
         );
     }
 
@@ -1235,6 +1331,33 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_fd_duplication_forms_stay_opaque() {
+        for script in [
+            "echo hi 1>&2",
+            "echo hi 3>&1",
+            "echo hi 2>&2",
+            "echo hi 2>&-",
+            "echo hi 2>&$fd",
+            "echo hi 2>&1-",
+            "echo hi 2>&01",
+            "echo hi 2> &1",
+            "echo hi 2 >&1",
+            "echo hi >&1",
+            "echo hi 2>\\&1",
+            "echo hi 2>&'1'",
+            "echo hi 2>&\"1\"",
+            "echo hi 2>&\\1",
+        ] {
+            let units = unit_strings(&["bash", "-c", script]);
+            assert_eq!(units.len(), 1, "{script:?}");
+            assert!(
+                matches!(units[0], ShellCommandUnit::Opaque(_)),
+                "{script:?}: {units:?}"
+            );
+        }
+    }
+
+    #[test]
     fn empty_payload_has_no_units() {
         assert_eq!(unit_strings(&["bash", "-c", ""]), Vec::new());
     }
@@ -1261,7 +1384,6 @@ mod tests {
             "echo hi 2>/tmp/null",
             "echo hi 2>/dev/nullish",
             "echo hi 20>/dev/null",
-            "echo hi 2>&1",
             "echo hi 2> $NULL",
             "echo hi 2> \"$NULL\"",
             "echo hi 2>\r/dev/null",

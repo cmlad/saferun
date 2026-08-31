@@ -893,6 +893,43 @@ mod tests {
     }
 
     #[test]
+    fn shell_ignores_stderr_stdout_duplication_without_prompting() {
+        let (_directory, config, policy) = policy(
+            "shell_prefixes: ['bash -c']\nallow:\n  - printf hi\n  - grep h\n  - cargo test\nask:\n  - '2>&1'\n",
+        );
+        let client = QueueClient::new([Err("must not be called")]);
+        let command = argv(&[
+            "bash",
+            "-c",
+            "printf hi 2>&1 | grep h 2>& 1 && cargo test 2>&1",
+        ]);
+        let outcome = authorize_invocation(&policy, &command, &config, false, None, &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Execute {
+            aggregate_kind,
+            units,
+        }) = outcome
+        else {
+            panic!("expected shell execution");
+        };
+        assert_eq!(aggregate_kind, AuthorizationKind::Allow);
+        assert_eq!(units.len(), 3);
+        assert_eq!(
+            units[0].unit,
+            ShellCommandUnit::Parsed(argv(&["printf", "hi"]))
+        );
+        assert_eq!(
+            units[1].unit,
+            ShellCommandUnit::Parsed(argv(&["grep", "h"]))
+        );
+        assert_eq!(
+            units[2].unit,
+            ShellCommandUnit::Parsed(argv(&["cargo", "test"]))
+        );
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
     fn shell_ignores_separator_adjacent_stderr_dev_null_without_prompting() {
         let (_directory, config, policy) = policy(
             "shell_prefixes: ['bash -c']\nallow:\n  - printf hi\n  - printf bye\n  - grep bye\n  - cargo test\nask:\n  - '2> /dev/null'\n",
@@ -945,6 +982,26 @@ mod tests {
             policy("shell_prefixes: ['bash -c']\nallow: [/bin/true]\nask: ['**']\n");
         let client = QueueClient::new([Err("must not be called")]);
         let command = argv(&["bash", "-c", "2>/dev/null"]);
+        let outcome = authorize_invocation(&policy, &command, &config, false, None, &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Execute {
+            aggregate_kind,
+            units,
+        }) = outcome
+        else {
+            panic!("expected shell execution");
+        };
+        assert_eq!(aggregate_kind, AuthorizationKind::Allow);
+        assert!(units.is_empty());
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn shell_ignores_stderr_stdout_duplication_only_payload_without_prompting() {
+        let (_directory, config, policy) =
+            policy("shell_prefixes: ['bash -c']\nallow: [/bin/true]\nask: ['**']\n");
+        let client = QueueClient::new([Err("must not be called")]);
+        let command = argv(&["bash", "-c", "2>&1; 2>& 1;"]);
         let outcome = authorize_invocation(&policy, &command, &config, false, None, &client);
 
         let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Execute {
@@ -1127,6 +1184,64 @@ mod tests {
     }
 
     #[test]
+    fn shell_ignores_stderr_stdout_duplication_while_authorizing_stdout_redirections() {
+        let (_directory, config, policy) = policy(
+            "shell_prefixes: ['bash -c']\nallow:\n  - printf hi\n  - printf bye\nask:\n  - '> out'\n  - '> second'\n",
+        );
+        let client = QueueClient::new([
+            approved(ApprovalScope::Once),
+            approved(ApprovalScope::Session),
+        ]);
+        let command = argv(&[
+            "bash",
+            "-c",
+            "printf hi > out 2>&1; printf bye 2>&1 > second",
+        ]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[4; 32]), &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Execute {
+            aggregate_kind,
+            units,
+        }) = outcome
+        else {
+            panic!("expected shell execution");
+        };
+        assert_eq!(aggregate_kind, AuthorizationKind::Ask);
+        assert_eq!(units.len(), 4);
+        assert_eq!(units[0].kind, AuthorizationKind::Allow);
+        assert_eq!(
+            units[0].unit,
+            ShellCommandUnit::Parsed(argv(&["printf", "hi"]))
+        );
+        assert_eq!(units[1].kind, AuthorizationKind::Ask);
+        assert_eq!(
+            units[1].unit,
+            ShellCommandUnit::Redirection {
+                operator: ">".into(),
+                target: "out".into(),
+            }
+        );
+        assert_eq!(units[2].kind, AuthorizationKind::Allow);
+        assert_eq!(
+            units[2].unit,
+            ShellCommandUnit::Parsed(argv(&["printf", "bye"]))
+        );
+        assert_eq!(units[3].kind, AuthorizationKind::Ask);
+        assert_eq!(
+            units[3].unit,
+            ShellCommandUnit::Redirection {
+                operator: ">".into(),
+                target: "second".into(),
+            }
+        );
+        assert_eq!(client.calls.get(), 2);
+        let requests = client.requests.borrow();
+        assert_eq!(requests[0].command, argv(&[">", "out"]));
+        assert_eq!(requests[1].command, argv(&[">", "second"]));
+    }
+
+    #[test]
     fn shell_redirection_asks_are_prompted_in_source_order() {
         let (_directory, config, policy) = policy(
             "shell_prefixes: ['bash -c']\nallow: [/bin/true]\nask:\n  - git push **\n  - '> out'\n",
@@ -1201,6 +1316,33 @@ mod tests {
         );
         let client = QueueClient::new([approved(ApprovalScope::Once)]);
         let command = argv(&["bash", "-c", "git push origin main; rm target 2>/dev/null"]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[5; 32]), &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
+            diagnostic: None,
+            units,
+        }) = outcome
+        else {
+            panic!("expected shell denial");
+        };
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].kind, AuthorizationKind::Ask);
+        assert_eq!(units[1].kind, AuthorizationKind::Deny);
+        assert_eq!(
+            units[1].unit,
+            ShellCommandUnit::Parsed(vec!["rm".into(), "target".into()])
+        );
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn shell_denial_is_detected_with_ignored_stderr_stdout_duplication() {
+        let (_directory, config, policy) = policy(
+            "shell_prefixes: ['bash -c']\nallow: [cargo test]\nask: ['git push **']\ndeny: ['rm **']\n",
+        );
+        let client = QueueClient::new([approved(ApprovalScope::Once)]);
+        let command = argv(&["bash", "-c", "git push origin main; rm target 2>&1"]);
         let outcome =
             authorize_invocation(&policy, &command, &config, false, Some(&[5; 32]), &client);
 
@@ -1558,6 +1700,34 @@ mod tests {
             policy("shell_prefixes: ['bash -c']\nallow:\n  - saferun **\nask:\n  - '**'\n");
         let client = QueueClient::new([approved(ApprovalScope::Once)]);
         let command = argv(&["bash", "-c", "saferun --dry-run -- git status 2>/dev/null"]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[8; 32]), &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
+            diagnostic: Some(message),
+            units,
+        }) = outcome
+        else {
+            panic!("expected nested saferun denial");
+        };
+        assert_eq!(
+            message,
+            "saferun: nested saferun invocation is not permitted: saferun --dry-run -- git status"
+        );
+        assert_eq!(units.len(), 1);
+        assert_eq!(
+            units[0].unit,
+            ShellCommandUnit::Parsed(argv(&["saferun", "--dry-run", "--", "git", "status"]))
+        );
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn nested_saferun_invocation_with_ignored_stderr_stdout_duplication_is_denied() {
+        let (_directory, config, policy) =
+            policy("shell_prefixes: ['bash -c']\nallow:\n  - saferun **\nask:\n  - '**'\n");
+        let client = QueueClient::new([approved(ApprovalScope::Once)]);
+        let command = argv(&["bash", "-c", "saferun --dry-run -- git status 2>&1"]);
         let outcome =
             authorize_invocation(&policy, &command, &config, false, Some(&[8; 32]), &client);
 

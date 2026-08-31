@@ -317,6 +317,31 @@ fn shell_dry_run_keeps_tilde_redirection_target_opaque() {
 }
 
 #[test]
+fn shell_dry_run_keeps_assignment_tilde_redirection_target_opaque() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = temp.path().join("saferun.yaml");
+    std::fs::write(
+        &config,
+        "shell_prefixes: ['bash -c']\nallow:\n  - ':'\nask:\n  - '> **'\n",
+    )
+    .expect("write config");
+    let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
+        .args(["--config"])
+        .arg(&config)
+        .args(["--dry-run", "--", "bash", "-c", ": > PATH=abc:~/out"])
+        .output()
+        .expect("run saferun");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"PART 1/1 ASK ': > PATH=abc:~/out' (ask='<no matched rule>')\n\
+          ASK bash -c ': > PATH=abc:~/out' (shell_parts=1)\n"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
 fn shell_dry_run_omits_stderr_dev_null_redirection_part() {
     let temp = tempfile::tempdir().expect("tempdir");
     let config = temp.path().join("saferun.yaml");

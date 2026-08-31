@@ -530,22 +530,35 @@ fn has_unsupported_redirection_target_meta(value: &str) -> bool {
     let mut double_quoted = false;
     let mut escaped = false;
     let mut word_start = true;
+    let mut assignment_tilde_site = false;
+    let mut assignment_scan = AssignmentTildeScan::new_word();
 
     for character in value.chars() {
         if escaped {
             escaped = false;
             word_start = false;
+            assignment_tilde_site = false;
+            assignment_scan.quoted_character();
             continue;
         }
         match character {
-            '\\' if !single_quoted => escaped = true,
+            '\\' if !single_quoted => {
+                escaped = true;
+                word_start = false;
+                assignment_tilde_site = false;
+                assignment_scan.quoted_character();
+            }
             '\'' if !double_quoted => {
                 single_quoted = !single_quoted;
                 word_start = false;
+                assignment_tilde_site = false;
+                assignment_scan.quoted_character();
             }
             '"' if !single_quoted => {
                 double_quoted = !double_quoted;
                 word_start = false;
+                assignment_tilde_site = false;
+                assignment_scan.quoted_character();
             }
             '$' | '`' if !single_quoted => return true,
             '*' | '?' | '[' | '{' | '}' | '|' | '&' | ';' | '(' | ')' | '<' | '>'
@@ -553,7 +566,9 @@ fn has_unsupported_redirection_target_meta(value: &str) -> bool {
             {
                 return true;
             }
-            '~' if !single_quoted && !double_quoted && word_start => return true,
+            '~' if !single_quoted && !double_quoted && (word_start || assignment_tilde_site) => {
+                return true;
+            }
             _ if !single_quoted
                 && !double_quoted
                 && is_unsupported_shell_analysis_whitespace(character) =>
@@ -562,12 +577,84 @@ fn has_unsupported_redirection_target_meta(value: &str) -> bool {
             }
             _ if !single_quoted && !double_quoted && is_shell_blank(character) => {
                 word_start = true;
+                assignment_tilde_site = false;
+                assignment_scan = AssignmentTildeScan::new_word();
             }
-            _ => word_start = false,
+            _ if !single_quoted && !double_quoted => {
+                word_start = false;
+                assignment_tilde_site = assignment_scan.unquoted_character(character);
+            }
+            _ => {
+                word_start = false;
+                assignment_tilde_site = false;
+            }
         }
     }
 
     false
+}
+
+/// Tracks redirection-target assignment contexts where shells expand `~`.
+enum AssignmentTildeScan {
+    Candidate(String),
+    Value,
+    NotAssignment,
+}
+
+impl AssignmentTildeScan {
+    fn new_word() -> Self {
+        Self::Candidate(String::new())
+    }
+
+    fn quoted_character(&mut self) {
+        if matches!(self, Self::Candidate(_)) {
+            *self = Self::NotAssignment;
+        }
+    }
+
+    fn unquoted_character(&mut self, character: char) -> bool {
+        match self {
+            Self::Candidate(prefix) => {
+                if character == '=' {
+                    if is_assignment_lhs(prefix) {
+                        *self = Self::Value;
+                        true
+                    } else {
+                        *self = Self::NotAssignment;
+                        false
+                    }
+                } else if is_assignment_lhs_character(character) || character == '+' {
+                    prefix.push(character);
+                    false
+                } else {
+                    *self = Self::NotAssignment;
+                    false
+                }
+            }
+            Self::Value => character == ':',
+            Self::NotAssignment => false,
+        }
+    }
+}
+
+fn is_assignment_lhs(raw: &str) -> bool {
+    if is_assignment_key(raw) {
+        return true;
+    }
+    raw.strip_suffix('+').is_some_and(is_assignment_key)
+}
+
+fn is_assignment_lhs_character(character: char) -> bool {
+    character == '_' || character.is_ascii_alphanumeric()
+}
+
+fn is_assignment_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
 fn is_shell_blank(character: char) -> bool {
@@ -668,12 +755,7 @@ fn is_assignment(value: &str) -> bool {
     let Some((key, _)) = value.split_once('=') else {
         return false;
     };
-    let mut chars = key.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first == '_' || first.is_ascii_alphabetic())
-        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+    is_assignment_key(key)
 }
 
 fn has_unquoted_brace_expansion(value: &str) -> bool {
@@ -955,12 +1037,76 @@ mod tests {
             unit_strings(&[
                 "bash",
                 "-c",
-                "printf hi > ~/out; printf bye >> ~root/out; printf ok > ~+/out",
+                concat!(
+                    "printf hi > ~/out; ",
+                    "printf bye >> ~root/out; ",
+                    "printf ok > ~+/out; ",
+                    ": > FOO=~/out; ",
+                    ": > FOO+=~/out; ",
+                    ": > PATH=abc:~/out; ",
+                    ": > PATH+=abc:~root/out",
+                ),
             ]),
             vec![
                 ShellCommandUnit::Opaque("'printf hi > ~/out'".into()),
                 ShellCommandUnit::Opaque("'printf bye >> ~root/out'".into()),
                 ShellCommandUnit::Opaque("'printf ok > ~+/out'".into()),
+                ShellCommandUnit::Opaque("': > FOO=~/out'".into()),
+                ShellCommandUnit::Opaque("': > FOO+=~/out'".into()),
+                ShellCommandUnit::Opaque("': > PATH=abc:~/out'".into()),
+                ShellCommandUnit::Opaque("': > PATH+=abc:~root/out'".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn redirection_target_tilde_near_misses_stay_static() {
+        assert_eq!(
+            unit_strings(&[
+                "bash",
+                "-c",
+                "printf hi > x~/out; printf bye >> FOO:~/out; printf ok > FOO=x~y/out",
+            ]),
+            vec![
+                ShellCommandUnit::Parsed(vec!["printf".into(), "hi".into()]),
+                ShellCommandUnit::Redirection {
+                    operator: ">".into(),
+                    target: "x~/out".into(),
+                },
+                ShellCommandUnit::Parsed(vec!["printf".into(), "bye".into()]),
+                ShellCommandUnit::Redirection {
+                    operator: ">>".into(),
+                    target: "FOO:~/out".into(),
+                },
+                ShellCommandUnit::Parsed(vec!["printf".into(), "ok".into()]),
+                ShellCommandUnit::Redirection {
+                    operator: ">".into(),
+                    target: "FOO=x~y/out".into(),
+                },
+            ]
+        );
+        assert_eq!(
+            unit_strings(&[
+                "bash",
+                "-c",
+                r#"printf hi > FOO==~/out; printf bye >> FOO=abc\:\~/out; printf ok > FOO=abc:"~"/out"#,
+            ]),
+            vec![
+                ShellCommandUnit::Parsed(vec!["printf".into(), "hi".into()]),
+                ShellCommandUnit::Redirection {
+                    operator: ">".into(),
+                    target: "FOO==~/out".into(),
+                },
+                ShellCommandUnit::Parsed(vec!["printf".into(), "bye".into()]),
+                ShellCommandUnit::Redirection {
+                    operator: ">>".into(),
+                    target: "FOO=abc:~/out".into(),
+                },
+                ShellCommandUnit::Parsed(vec!["printf".into(), "ok".into()]),
+                ShellCommandUnit::Redirection {
+                    operator: ">".into(),
+                    target: "FOO=abc:~/out".into(),
+                },
             ]
         );
     }

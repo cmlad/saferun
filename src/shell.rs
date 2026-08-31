@@ -247,7 +247,6 @@ fn has_literal_command_words(segment: &ShellSegment) -> bool {
 
 fn is_literal_simple_command_source(command: &str) -> bool {
     !has_unquoted_brace_expansion(command)
-        && !has_unquoted_tilde_expansion(command)
         && !has_unquoted_glob(command)
         && !has_unquoted_redirection(command)
 }
@@ -256,10 +255,7 @@ fn supported_static_redirection(
     segment: &ShellSegment,
     command: &str,
 ) -> Option<(Vec<String>, ShellCommandUnit)> {
-    if has_unquoted_brace_expansion(command)
-        || has_unquoted_tilde_expansion(command)
-        || has_unquoted_glob(command)
-    {
+    if has_unquoted_brace_expansion(command) || has_unquoted_glob(command) {
         return None;
     }
 
@@ -533,41 +529,29 @@ fn has_unsupported_redirection_target_meta(value: &str) -> bool {
     let mut single_quoted = false;
     let mut double_quoted = false;
     let mut escaped = false;
-    let mut word_start = true;
 
     for character in value.chars() {
         if escaped {
             escaped = false;
-            word_start = false;
             continue;
         }
         match character {
             '\\' if !single_quoted => escaped = true,
-            '\'' if !double_quoted => {
-                single_quoted = !single_quoted;
-                word_start = false;
-            }
-            '"' if !single_quoted => {
-                double_quoted = !double_quoted;
-                word_start = false;
-            }
+            '\'' if !double_quoted => single_quoted = !single_quoted,
+            '"' if !single_quoted => double_quoted = !double_quoted,
             '$' | '`' if !single_quoted => return true,
             '*' | '?' | '[' | '{' | '}' | '|' | '&' | ';' | '(' | ')' | '<' | '>'
                 if !single_quoted && !double_quoted =>
             {
                 return true;
             }
-            '~' if !single_quoted && !double_quoted && word_start => return true,
             _ if !single_quoted
                 && !double_quoted
                 && is_unsupported_shell_analysis_whitespace(character) =>
             {
                 return true;
             }
-            _ if !single_quoted && !double_quoted && is_shell_blank(character) => {
-                word_start = true;
-            }
-            _ => word_start = false,
+            _ => {}
         }
     }
 
@@ -682,39 +666,6 @@ fn is_assignment(value: &str) -> bool {
 
 fn has_unquoted_brace_expansion(value: &str) -> bool {
     has_unquoted_meta(value, &['{', '}'])
-}
-
-fn has_unquoted_tilde_expansion(value: &str) -> bool {
-    let mut single_quoted = false;
-    let mut double_quoted = false;
-    let mut escaped = false;
-    let mut word_start = true;
-
-    for character in value.chars() {
-        if escaped {
-            escaped = false;
-            word_start = false;
-            continue;
-        }
-        match character {
-            '\\' if !single_quoted => escaped = true,
-            '\'' if !double_quoted => {
-                single_quoted = !single_quoted;
-                word_start = false;
-            }
-            '"' if !single_quoted => {
-                double_quoted = !double_quoted;
-                word_start = false;
-            }
-            _ if !single_quoted && !double_quoted && character.is_ascii_whitespace() => {
-                word_start = true;
-            }
-            '~' if !single_quoted && !double_quoted && word_start => return true,
-            _ => word_start = false,
-        }
-    }
-
-    false
 }
 
 fn has_unquoted_meta(value: &str, metas: &[char]) -> bool {
@@ -902,6 +853,33 @@ mod tests {
     }
 
     #[test]
+    fn tilde_forms_stay_literal_arguments() {
+        assert_eq!(
+            unit_strings(&["bash", "-c", r#"printf ~ ~/src ~root/bin ~+ ~- \~"#]),
+            vec![ShellCommandUnit::Parsed(vec![
+                "printf".into(),
+                "~".into(),
+                "~/src".into(),
+                "~root/bin".into(),
+                "~+".into(),
+                "~-".into(),
+                "~".into(),
+            ])]
+        );
+    }
+
+    #[test]
+    fn tilde_in_command_position_stays_literal() {
+        assert_eq!(
+            unit_strings(&["bash", "-c", "~/bin/tool --version"]),
+            vec![ShellCommandUnit::Parsed(vec![
+                "~/bin/tool".into(),
+                "--version".into(),
+            ])]
+        );
+    }
+
+    #[test]
     fn supported_chains_and_pipelines_reconstruct_argv() {
         assert_eq!(
             unit_strings(&["bash", "-c", "printf hi|grep h&&cargo test;"]),
@@ -960,6 +938,25 @@ mod tests {
     }
 
     #[test]
+    fn tilde_redirection_targets_decompose_literally() {
+        assert_eq!(
+            unit_strings(&["bash", "-c", "printf hi > ~/out; printf bye >> ~root/out",]),
+            vec![
+                ShellCommandUnit::Parsed(vec!["printf".into(), "hi".into()]),
+                ShellCommandUnit::Redirection {
+                    operator: ">".into(),
+                    target: "~/out".into(),
+                },
+                ShellCommandUnit::Parsed(vec!["printf".into(), "bye".into()]),
+                ShellCommandUnit::Redirection {
+                    operator: ">>".into(),
+                    target: "~root/out".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn stderr_dev_null_redirections_are_ignored_after_literal_commands() {
         assert_eq!(
             unit_strings(&[
@@ -970,6 +967,22 @@ mod tests {
             vec![
                 ShellCommandUnit::Parsed(vec!["printf".into(), "hi".into()]),
                 ShellCommandUnit::Parsed(vec!["printf".into(), "bye".into()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn tilde_forms_compose_with_supported_operators_and_ignored_stderr() {
+        assert_eq!(
+            unit_strings(&[
+                "bash",
+                "-c",
+                "ls ~/.codex/ 2>/dev/null | grep ~; printf ~/src 2> /dev/null",
+            ]),
+            vec![
+                ShellCommandUnit::Parsed(vec!["ls".into(), "~/.codex/".into()]),
+                ShellCommandUnit::Parsed(vec!["grep".into(), "~".into()]),
+                ShellCommandUnit::Parsed(vec!["printf".into(), "~/src".into()]),
             ]
         );
     }
@@ -1107,9 +1120,12 @@ mod tests {
             "echo hi > file extra",
             "echo $(date)",
             "echo $HOME",
+            "echo ~/$HOME",
+            "echo ~/$(date)",
+            "~/bin/$TOOL --version",
             "echo {a,b}",
             "r{m,} target",
-            "~/bin/tool --version",
+            "echo ~/*.log",
             "echo *",
             "cargo test || git status",
             "sleep 1 & git status",

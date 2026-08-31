@@ -207,6 +207,31 @@ fn shell_dry_run_prints_parts_and_aggregate_decision() {
 }
 
 #[test]
+fn shell_dry_run_authorizes_tilde_as_literal_argument() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = temp.path().join("saferun.yaml");
+    std::fs::write(
+        &config,
+        "shell_prefixes: ['bash -c']\nallow:\n  - ls **\nask:\n  - git push **\n",
+    )
+    .expect("write config");
+    let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
+        .args(["--config"])
+        .arg(&config)
+        .args(["--dry-run", "--", "bash", "-c", "ls ~/.codex/"])
+        .output()
+        .expect("run saferun");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"PART 1/1 ALLOW ls '~/.codex/' (allow='ls **')\n\
+          ALLOW bash -c 'ls ~/.codex/' (shell_parts=1)\n"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
 fn shell_dry_run_prints_redirection_parts() {
     let temp = tempfile::tempdir().expect("tempdir");
     let config = temp.path().join("saferun.yaml");
@@ -554,6 +579,32 @@ fn shell_invocation_executes_original_command_after_parts_are_allowed() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(output.stdout, b"okdone");
     assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
+fn shell_invocation_executes_original_tilde_expansion_after_literal_authorization() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    std::fs::create_dir(&home).expect("create home");
+    let config = temp.path().join("saferun.yaml");
+    let target = home.join("tilde-out");
+    std::fs::write(
+        &config,
+        "shell_prefixes: ['/bin/bash -c']\nallow:\n  - printf ok\n  - '> ~/tilde-out'\n",
+    )
+    .expect("write config");
+    let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
+        .env("HOME", &home)
+        .args(["--config"])
+        .arg(&config)
+        .args(["--", "/bin/bash", "-c", "printf ok > ~/tilde-out"])
+        .output()
+        .expect("run saferun");
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(std::fs::read(&target).expect("read target"), b"ok");
 }
 
 #[test]

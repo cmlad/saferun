@@ -1406,7 +1406,32 @@ mod tests {
     }
 
     #[test]
-    fn shell_command_position_tilde_expansion_cannot_use_literal_allow_to_bypass_deny() {
+    fn shell_tilde_argument_matches_literal_policy_without_approval() {
+        let (_directory, config, policy) =
+            policy("shell_prefixes: ['bash -c']\nallow:\n  - ls **\nask:\n  - git push **\n");
+        let client = QueueClient::new([Err("must not be called")]);
+        let command = argv(&["bash", "-c", "ls ~/.codex/"]);
+        let outcome = authorize_invocation(&policy, &command, &config, false, None, &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Execute {
+            aggregate_kind,
+            units,
+        }) = outcome
+        else {
+            panic!("expected shell execution");
+        };
+        assert_eq!(aggregate_kind, AuthorizationKind::Allow);
+        assert_eq!(units.len(), 1);
+        assert_eq!(
+            units[0].unit,
+            ShellCommandUnit::Parsed(vec!["ls".into(), "~/.codex/".into()])
+        );
+        assert_eq!(units[0].kind, AuthorizationKind::Allow);
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn shell_command_position_tilde_matches_literal_policy_without_expansion() {
         let (_directory, config, policy) = policy(
             "shell_prefixes: ['bash -c']\nallow:\n  - ~/bin/danger target\ndeny:\n  - /expanded/home/bin/danger **\n",
         );
@@ -1421,13 +1446,13 @@ mod tests {
         else {
             panic!("expected shell dry-run");
         };
-        assert_eq!(aggregate_kind, AuthorizationKind::Ask);
+        assert_eq!(aggregate_kind, AuthorizationKind::Allow);
         assert_eq!(units.len(), 1);
         assert_eq!(
             units[0].unit,
-            ShellCommandUnit::Opaque("'~/bin/danger target'".into())
+            ShellCommandUnit::Parsed(vec!["~/bin/danger".into(), "target".into()])
         );
-        assert!(units[0].matched.is_implicit());
+        assert_eq!(units[0].kind, AuthorizationKind::Allow);
         assert_eq!(client.calls.get(), 0);
     }
 

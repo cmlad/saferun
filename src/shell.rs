@@ -529,29 +529,41 @@ fn has_unsupported_redirection_target_meta(value: &str) -> bool {
     let mut single_quoted = false;
     let mut double_quoted = false;
     let mut escaped = false;
+    let mut word_start = true;
 
     for character in value.chars() {
         if escaped {
             escaped = false;
+            word_start = false;
             continue;
         }
         match character {
             '\\' if !single_quoted => escaped = true,
-            '\'' if !double_quoted => single_quoted = !single_quoted,
-            '"' if !single_quoted => double_quoted = !double_quoted,
+            '\'' if !double_quoted => {
+                single_quoted = !single_quoted;
+                word_start = false;
+            }
+            '"' if !single_quoted => {
+                double_quoted = !double_quoted;
+                word_start = false;
+            }
             '$' | '`' if !single_quoted => return true,
             '*' | '?' | '[' | '{' | '}' | '|' | '&' | ';' | '(' | ')' | '<' | '>'
                 if !single_quoted && !double_quoted =>
             {
                 return true;
             }
+            '~' if !single_quoted && !double_quoted && word_start => return true,
             _ if !single_quoted
                 && !double_quoted
                 && is_unsupported_shell_analysis_whitespace(character) =>
             {
                 return true;
             }
-            _ => {}
+            _ if !single_quoted && !double_quoted && is_shell_blank(character) => {
+                word_start = true;
+            }
+            _ => word_start = false,
         }
     }
 
@@ -938,20 +950,17 @@ mod tests {
     }
 
     #[test]
-    fn tilde_redirection_targets_decompose_literally() {
+    fn tilde_expansion_redirection_targets_stay_opaque() {
         assert_eq!(
-            unit_strings(&["bash", "-c", "printf hi > ~/out; printf bye >> ~root/out",]),
+            unit_strings(&[
+                "bash",
+                "-c",
+                "printf hi > ~/out; printf bye >> ~root/out; printf ok > ~+/out",
+            ]),
             vec![
-                ShellCommandUnit::Parsed(vec!["printf".into(), "hi".into()]),
-                ShellCommandUnit::Redirection {
-                    operator: ">".into(),
-                    target: "~/out".into(),
-                },
-                ShellCommandUnit::Parsed(vec!["printf".into(), "bye".into()]),
-                ShellCommandUnit::Redirection {
-                    operator: ">>".into(),
-                    target: "~root/out".into(),
-                },
+                ShellCommandUnit::Opaque("'printf hi > ~/out'".into()),
+                ShellCommandUnit::Opaque("'printf bye >> ~root/out'".into()),
+                ShellCommandUnit::Opaque("'printf ok > ~+/out'".into()),
             ]
         );
     }

@@ -292,6 +292,31 @@ fn shell_dry_run_prints_dev_null_redirection_part() {
 }
 
 #[test]
+fn shell_dry_run_keeps_tilde_redirection_target_opaque() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = temp.path().join("saferun.yaml");
+    std::fs::write(
+        &config,
+        "shell_prefixes: ['bash -c']\nallow:\n  - printf hi\nask:\n  - '> **'\n",
+    )
+    .expect("write config");
+    let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
+        .args(["--config"])
+        .arg(&config)
+        .args(["--dry-run", "--", "bash", "-c", "printf hi > ~/out"])
+        .output()
+        .expect("run saferun");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"PART 1/1 ASK 'printf hi > ~/out' (ask='<no matched rule>')\n\
+          ASK bash -c 'printf hi > ~/out' (shell_parts=1)\n"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
 fn shell_dry_run_omits_stderr_dev_null_redirection_part() {
     let temp = tempfile::tempdir().expect("tempdir");
     let config = temp.path().join("saferun.yaml");
@@ -587,24 +612,26 @@ fn shell_invocation_executes_original_tilde_expansion_after_literal_authorizatio
     let home = temp.path().join("home");
     std::fs::create_dir(&home).expect("create home");
     let config = temp.path().join("saferun.yaml");
-    let target = home.join("tilde-out");
+    let target = home.join("tilde-arg");
     std::fs::write(
         &config,
-        "shell_prefixes: ['/bin/bash -c']\nallow:\n  - printf ok\n  - '> ~/tilde-out'\n",
+        "shell_prefixes: ['/bin/bash -c']\nallow:\n  - printf %s ~/tilde-arg\n",
     )
     .expect("write config");
     let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
         .env("HOME", &home)
         .args(["--config"])
         .arg(&config)
-        .args(["--", "/bin/bash", "-c", "printf ok > ~/tilde-out"])
+        .args(["--", "/bin/bash", "-c", "printf %s ~/tilde-arg"])
         .output()
         .expect("run saferun");
 
     assert!(output.status.success(), "{output:?}");
-    assert!(output.stdout.is_empty(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        target.display().to_string()
+    );
     assert!(output.stderr.is_empty(), "{output:?}");
-    assert_eq!(std::fs::read(&target).expect("read target"), b"ok");
 }
 
 #[test]

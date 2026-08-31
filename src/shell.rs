@@ -1,4 +1,6 @@
-use agent_shell_parser::parse::{parse_with_substitutions, Operator, ParsedPipeline, ShellSegment};
+use agent_shell_parser::parse::{
+    parse_with_substitutions, Operator, ParsedPipeline, ShellSegment, Word, WordKind,
+};
 
 use crate::policy::{
     configured_prefix_remainders, shell_prefix_matches, shlex_join, shlex_quote, Policy,
@@ -209,7 +211,7 @@ fn units_from_segment(segment: &ShellSegment) -> Vec<ShellCommandUnit> {
         return vec![opaque(command)];
     }
 
-    if !has_literal_command_words(segment) {
+    if !has_authorizable_command_words(segment) {
         return vec![opaque(command)];
     }
 
@@ -236,30 +238,35 @@ fn opaque(command: &str) -> ShellCommandUnit {
     ShellCommandUnit::Opaque(shlex_quote(command))
 }
 
-fn has_literal_command_words(segment: &ShellSegment) -> bool {
+fn has_authorizable_command_words(segment: &ShellSegment) -> bool {
     segment.substitutions.is_empty()
         && !segment.words.is_empty()
         && !segment
             .words
             .iter()
-            .any(|word| word.is_assignment() || word.is_expansion())
+            .any(|word| word.is_assignment() || has_unsupported_word_expansion(word))
+}
+
+fn has_unsupported_word_expansion(word: &Word) -> bool {
+    match word.kind() {
+        WordKind::Literal | WordKind::VariableExpansion => false,
+        WordKind::Unclassified => word.is_expansion(),
+        WordKind::CommandSubstitution | WordKind::ArithmeticExpansion | WordKind::Dynamic => true,
+    }
 }
 
 fn is_literal_simple_command_source(command: &str) -> bool {
-    !has_unquoted_brace_expansion(command)
-        && !has_unquoted_glob(command)
-        && !has_unquoted_redirection(command)
+    !has_unsupported_command_word_meta(command)
 }
 
 fn supported_static_redirection(
     segment: &ShellSegment,
     command: &str,
 ) -> Option<(Vec<String>, ShellCommandUnit)> {
-    if has_unquoted_brace_expansion(command) || has_unquoted_glob(command) {
+    let split = split_supported_redirection_suffix(command.trim())?;
+    if !is_literal_simple_command_source(split.command) {
         return None;
     }
-
-    let split = split_supported_redirection_suffix(command.trim())?;
     let argv = shlex::split(split.command)?;
     if argv.is_empty() {
         return None;
@@ -385,17 +392,20 @@ fn explicit_redirection_fd(command: &str, operator_index: usize) -> Option<(usiz
     if digit_start == trimmed.len() {
         return None;
     }
-    if !has_redirection_fd_boundary(&trimmed[..digit_start]) {
+    if !has_redirection_fd_boundary(command, digit_start) {
         return None;
     }
 
     Some((digit_start, &trimmed[digit_start..]))
 }
 
-fn has_redirection_fd_boundary(before_fd: &str) -> bool {
-    let Some(previous) = before_fd.chars().next_back() else {
+fn has_redirection_fd_boundary(command: &str, fd_start: usize) -> bool {
+    let Some((previous_index, previous)) = previous_char(command, fd_start) else {
         return true;
     };
+    if !is_active_shell_syntax_at(command, previous_index) {
+        return false;
+    }
     if is_shell_blank(previous) || matches!(previous, ';' | '|') {
         return true;
     }
@@ -403,11 +413,39 @@ fn has_redirection_fd_boundary(before_fd: &str) -> bool {
         return false;
     }
 
-    before_fd
-        .chars()
-        .rev()
-        .nth(1)
-        .is_some_and(|character| character == '&')
+    let Some((before_previous_index, before_previous)) = previous_char(command, previous_index)
+    else {
+        return false;
+    };
+    before_previous == '&' && is_active_shell_syntax_at(command, before_previous_index)
+}
+
+fn previous_char(value: &str, before: usize) -> Option<(usize, char)> {
+    value[..before].char_indices().next_back()
+}
+
+fn is_active_shell_syntax_at(command: &str, target_index: usize) -> bool {
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+
+    for (index, character) in command.char_indices() {
+        if index == target_index {
+            return !escaped && !single_quoted && !double_quoted;
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if !single_quoted => escaped = true,
+            '\'' if !double_quoted => single_quoted = !single_quoted,
+            '"' if !single_quoted => double_quoted = !double_quoted,
+            _ => {}
+        }
+    }
+
+    false
 }
 
 fn skip_horizontal_whitespace(command: &str, mut index: usize) -> usize {
@@ -746,12 +784,113 @@ fn trim_horizontal_start(value: &str) -> &str {
     value.trim_start_matches(|character: char| character.is_ascii_whitespace() && character != '\n')
 }
 
-fn has_unquoted_glob(value: &str) -> bool {
-    has_unquoted_meta(value, &['*', '?', '['])
+fn has_unsupported_command_word_meta(value: &str) -> bool {
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    let mut index = 0;
+
+    while let Some((character, next_index)) = char_at(value, index) {
+        if escaped {
+            escaped = false;
+            index = next_index;
+            continue;
+        }
+        match character {
+            '\\' if !single_quoted => {
+                escaped = true;
+                index = next_index;
+            }
+            '\'' if !double_quoted => {
+                single_quoted = !single_quoted;
+                index = next_index;
+            }
+            '"' if !single_quoted => {
+                double_quoted = !double_quoted;
+                index = next_index;
+            }
+            '`' if !single_quoted => return true,
+            '$' if !single_quoted => {
+                let Some(end) = allowed_parameter_reference_end(value, next_index) else {
+                    return true;
+                };
+                index = end;
+            }
+            '*' | '?' | '[' | '{' | '}' | '|' | '&' | ';' | '(' | ')' | '<' | '>'
+                if !single_quoted && !double_quoted =>
+            {
+                return true;
+            }
+            _ => index = next_index,
+        }
+    }
+
+    false
 }
 
-fn has_unquoted_redirection(value: &str) -> bool {
-    has_unquoted_meta(value, &['<', '>'])
+fn allowed_parameter_reference_end(value: &str, start: usize) -> Option<usize> {
+    let (character, next_index) = char_at(value, start)?;
+    match character {
+        '{' => braced_parameter_reference_end(value, next_index),
+        character if is_parameter_name_start(character) => {
+            Some(consume_parameter_name(value, next_index))
+        }
+        character if character.is_ascii_digit() => Some(consume_digits(value, next_index)),
+        character if is_special_parameter(character) => Some(next_index),
+        _ => None,
+    }
+}
+
+fn braced_parameter_reference_end(value: &str, start: usize) -> Option<usize> {
+    let (character, next_index) = char_at(value, start)?;
+    let end = if is_parameter_name_start(character) {
+        consume_parameter_name(value, next_index)
+    } else if character.is_ascii_digit() {
+        consume_digits(value, next_index)
+    } else if is_special_parameter(character) {
+        next_index
+    } else {
+        return None;
+    };
+    let (close, after_close) = char_at(value, end)?;
+    (close == '}').then_some(after_close)
+}
+
+fn consume_parameter_name(value: &str, mut index: usize) -> usize {
+    while let Some((character, next_index)) = char_at(value, index) {
+        if !is_parameter_name_character(character) {
+            break;
+        }
+        index = next_index;
+    }
+    index
+}
+
+fn consume_digits(value: &str, mut index: usize) -> usize {
+    while let Some((character, next_index)) = char_at(value, index) {
+        if !character.is_ascii_digit() {
+            break;
+        }
+        index = next_index;
+    }
+    index
+}
+
+fn is_parameter_name_start(character: char) -> bool {
+    character == '_' || character.is_ascii_alphabetic()
+}
+
+fn is_parameter_name_character(character: char) -> bool {
+    character == '_' || character.is_ascii_alphanumeric()
+}
+
+fn is_special_parameter(character: char) -> bool {
+    matches!(character, '@' | '*' | '#' | '?' | '$' | '!' | '-')
+}
+
+fn char_at(value: &str, index: usize) -> Option<(char, usize)> {
+    let character = value[index..].chars().next()?;
+    Some((character, index + character.len_utf8()))
 }
 
 pub(crate) fn strip_leading_assignments(argv: &[String]) -> Option<&[String]> {
@@ -768,32 +907,6 @@ fn is_assignment(value: &str) -> bool {
         return false;
     };
     is_assignment_key(key)
-}
-
-fn has_unquoted_brace_expansion(value: &str) -> bool {
-    has_unquoted_meta(value, &['{', '}'])
-}
-
-fn has_unquoted_meta(value: &str, metas: &[char]) -> bool {
-    let mut single_quoted = false;
-    let mut double_quoted = false;
-    let mut escaped = false;
-
-    for character in value.chars() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match character {
-            '\\' if !single_quoted => escaped = true,
-            '\'' if !double_quoted => single_quoted = !single_quoted,
-            '"' if !single_quoted => double_quoted = !double_quoted,
-            _ if !single_quoted && !double_quoted && metas.contains(&character) => return true,
-            _ => {}
-        }
-    }
-
-    false
 }
 
 #[cfg(test)]
@@ -982,6 +1095,50 @@ mod tests {
                 "~/bin/tool".into(),
                 "--version".into(),
             ])]
+        );
+    }
+
+    #[test]
+    fn variable_expansions_stay_literal_arguments() {
+        assert_eq!(
+            unit_strings(&[
+                "bash",
+                "-c",
+                r#"printf "$REQUEST" $OTHER pre$A${B}post '$NO_EXPAND' \$ESCAPED $1 ${10} "$@" $* $? $$ $! $# $-"#,
+            ]),
+            vec![ShellCommandUnit::Parsed(vec![
+                "printf".into(),
+                "$REQUEST".into(),
+                "$OTHER".into(),
+                "pre$A${B}post".into(),
+                "$NO_EXPAND".into(),
+                "$ESCAPED".into(),
+                "$1".into(),
+                "${10}".into(),
+                "$@".into(),
+                "$*".into(),
+                "$?".into(),
+                "$$".into(),
+                "$!".into(),
+                "$#".into(),
+                "$-".into(),
+            ])]
+        );
+    }
+
+    #[test]
+    fn variable_expansions_stay_literal_in_command_position() {
+        assert_eq!(
+            unit_strings(&[
+                "bash",
+                "-c",
+                "$TOOL --version; ~/bin/$TOOL run; ${TOOL} status",
+            ]),
+            vec![
+                ShellCommandUnit::Parsed(vec!["$TOOL".into(), "--version".into()]),
+                ShellCommandUnit::Parsed(vec!["~/bin/$TOOL".into(), "run".into()]),
+                ShellCommandUnit::Parsed(vec!["${TOOL}".into(), "status".into()]),
+            ]
         );
     }
 
@@ -1300,12 +1457,56 @@ mod tests {
     }
 
     #[test]
-    fn quoted_expansions_with_ignored_stderr_dev_null_stay_opaque() {
+    fn escaped_stderr_stdout_duplication_boundaries_stay_opaque() {
         for script in [
-            "echo \"$HOME\" 2>/dev/null",
-            "echo \"${VAR}\" 2>/dev/null",
+            r#"printf safe\;2>&1"#,
+            r#"printf safe\ 2>&1"#,
+            r#"printf safe\|2>&1"#,
+            r#"printf safe\&2>&1"#,
+        ] {
+            let units = unit_strings(&["bash", "-c", script]);
+            assert_eq!(units.len(), 1, "{script:?}");
+            assert!(
+                matches!(units[0], ShellCommandUnit::Opaque(_)),
+                "{script:?}: {units:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn variable_expansions_compose_with_ignored_redirections() {
+        assert_eq!(
+            unit_strings(&[
+                "bash",
+                "-c",
+                r#"printf "$REQUEST" 2>/dev/null | grep $PATTERN 2>&1"#,
+            ]),
+            vec![
+                ShellCommandUnit::Parsed(vec!["printf".into(), "$REQUEST".into()]),
+                ShellCommandUnit::Parsed(vec!["grep".into(), "$PATTERN".into()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn command_arithmetic_and_malformed_expansions_stay_opaque() {
+        for script in [
             "echo \"$(date)\" 2>/dev/null",
             "echo \"$((1 + 2))\" 2>/dev/null",
+            "echo $(date)",
+            "echo `date`",
+            "echo <(date)",
+            "echo >(cat)",
+            "echo $((1 + 2))",
+            "echo ${VAR:-default}",
+            "echo ${VAR?missing}",
+            "echo ${VAR//a/b}",
+            "echo ${VAR:-$(date)}",
+            "echo ${VAR:$((1)):1}",
+            "echo ${VAR",
+            "echo ${}",
+            "echo $",
+            "echo $:",
         ] {
             let units = unit_strings(&["bash", "-c", script]);
             assert_eq!(units.len(), 1, "{script:?}");
@@ -1395,11 +1596,7 @@ mod tests {
             "echo hi &> file",
             "echo hi &> /dev/null",
             "echo hi > file extra",
-            "echo $(date)",
-            "echo $HOME",
-            "echo ~/$HOME",
             "echo ~/$(date)",
-            "~/bin/$TOOL --version",
             "echo {a,b}",
             "r{m,} target",
             "echo ~/*.log",

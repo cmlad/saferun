@@ -1,4 +1,6 @@
-prefixes:
+shell_prefixes:
+- bash -c
+- /bin/bash -c
 - /bin/zsh -lc
 allow:
 - bop jobs

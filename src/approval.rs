@@ -16,7 +16,6 @@ use crate::policy::IMPLICIT_ASK_SOURCE;
 
 pub const PROTOCOL_VERSION: u8 = 3;
 pub const MAX_FRAME_LEN: usize = 65_536;
-pub const SESSION_TOKEN_FILE_ENV: &str = "SAFERUN_TOKEN_FILE";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

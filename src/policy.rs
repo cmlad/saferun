@@ -87,6 +87,7 @@ pub enum PolicyDecision<'a> {
 #[derive(Debug)]
 pub struct Policy {
     prefixes: Vec<Rule>,
+    shell_prefixes: Vec<Rule>,
     ask: Vec<Rule>,
     allow: Vec<Rule>,
     deny: Vec<Rule>,
@@ -98,6 +99,14 @@ impl Policy {
     pub fn digest(&self) -> [u8; 32] {
         self.digest
     }
+
+    pub fn implicit_ask_match(&self) -> RuleMatch<'_> {
+        RuleMatch {
+            rule: &self.implicit_ask,
+            prefix: None,
+            prefix_parts_consumed: 0,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -105,11 +114,33 @@ impl Policy {
 struct SaferunConfig {
     #[serde(default)]
     prefixes: Vec<String>,
+    #[serde(default)]
+    shell_prefixes: Vec<String>,
     allow: Vec<String>,
     #[serde(default)]
     ask: Vec<String>,
     #[serde(default)]
     deny: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ShellPrefixMatch<'a> {
+    rule: &'a Rule,
+    parts_consumed: usize,
+}
+
+impl<'a> ShellPrefixMatch<'a> {
+    pub fn rule(&self) -> &'a Rule {
+        self.rule
+    }
+
+    pub fn rule_source(&self) -> &'a str {
+        self.rule.source()
+    }
+
+    pub fn parts_consumed(&self) -> usize {
+        self.parts_consumed
+    }
 }
 
 /// Parse a rule source string into a compiled `Rule`.
@@ -233,7 +264,13 @@ fn parse_policy(text: &str, digest: [u8; 32]) -> Result<Policy, ConfigError> {
             "allow must contain at least one entry".to_string(),
         ));
     }
-    for entries in [&config.prefixes, &config.ask, &config.allow, &config.deny] {
+    for entries in [
+        &config.prefixes,
+        &config.shell_prefixes,
+        &config.ask,
+        &config.allow,
+        &config.deny,
+    ] {
         for entry in entries {
             if entry.trim().is_empty() {
                 return Err(ConfigError("entries must not be empty".to_string()));
@@ -245,6 +282,11 @@ fn parse_policy(text: &str, digest: [u8; 32]) -> Result<Policy, ConfigError> {
         .prefixes
         .iter()
         .map(|value| parse_rule("prefix", value))
+        .collect::<Result<Vec<_>, _>>()?;
+    let shell_prefixes = config
+        .shell_prefixes
+        .iter()
+        .map(|value| parse_rule("shell_prefix", value))
         .collect::<Result<Vec<_>, _>>()?;
     let ask = config
         .ask
@@ -264,6 +306,7 @@ fn parse_policy(text: &str, digest: [u8; 32]) -> Result<Policy, ConfigError> {
 
     Ok(Policy {
         prefixes,
+        shell_prefixes,
         ask,
         allow,
         deny,
@@ -351,10 +394,18 @@ fn find_rule_match<'a>(
     None
 }
 
-fn find_deny_match(prefixes: &[Rule], denied: &[Rule], argv: &[String]) -> bool {
+fn find_deny_match<'a>(
+    prefixes: &'a [Rule],
+    denied: &'a [Rule],
+    argv: &[String],
+) -> Option<RuleMatch<'a>> {
     for command in denied {
         if rule_matches_command(command, argv) {
-            return true;
+            return Some(RuleMatch {
+                rule: command,
+                prefix: None,
+                prefix_parts_consumed: 0,
+            });
         }
     }
 
@@ -363,18 +414,54 @@ fn find_deny_match(prefixes: &[Rule], denied: &[Rule], argv: &[String]) -> bool 
             let rest = &argv[consumed..];
             for command in denied {
                 if rule_matches_command(command, rest) {
-                    return true;
+                    return Some(RuleMatch {
+                        rule: command,
+                        prefix: Some(prefix),
+                        prefix_parts_consumed: consumed,
+                    });
                 }
             }
         }
     }
 
-    false
+    None
+}
+
+pub fn is_denied(policy: &Policy, argv: &[String]) -> bool {
+    deny_match(policy, argv).is_some()
+}
+
+pub fn deny_match<'a>(policy: &'a Policy, argv: &[String]) -> Option<RuleMatch<'a>> {
+    find_deny_match(&policy.prefixes, &policy.deny, argv)
+}
+
+pub fn configured_prefix_remainders<'a>(policy: &Policy, argv: &'a [String]) -> Vec<&'a [String]> {
+    prefix_matches(&policy.prefixes, argv)
+        .into_iter()
+        .map(|(_, consumed)| &argv[consumed..])
+        .collect()
+}
+
+pub fn configured_prefix_consumptions(policy: &Policy, argv: &[String]) -> Vec<usize> {
+    prefix_matches(&policy.prefixes, argv)
+        .into_iter()
+        .map(|(_, consumed)| consumed)
+        .collect()
+}
+
+pub fn shell_prefix_matches<'a>(policy: &'a Policy, argv: &[String]) -> Vec<ShellPrefixMatch<'a>> {
+    prefix_matches(&policy.shell_prefixes, argv)
+        .into_iter()
+        .map(|(rule, parts_consumed)| ShellPrefixMatch {
+            rule,
+            parts_consumed,
+        })
+        .collect()
 }
 
 /// Classify with precedence `deny > ask > allow > implicit ask`.
 pub fn classify<'a>(policy: &'a Policy, argv: &[String]) -> PolicyDecision<'a> {
-    if find_deny_match(&policy.prefixes, &policy.deny, argv) {
+    if deny_match(policy, argv).is_some() {
         return PolicyDecision::Deny;
     }
     if let Some(matched) = find_rule_match(&policy.prefixes, &policy.ask, argv) {
@@ -581,6 +668,22 @@ mod tests {
         assert!(unprefixed.is_implicit());
         assert_eq!(unprefixed.prefix_rule_source(), None);
         assert_eq!(unprefixed.prefix_parts_consumed(), 0);
+    }
+
+    #[test]
+    fn shell_prefixes_do_not_behave_like_generic_prefixes() {
+        let parsed = policy("shell_prefixes:\n  - bash -c\nallow:\n  - cargo test\n");
+        let command = argv(&["bash", "-c", "cargo test"]);
+        let PolicyDecision::Ask(matched) = classify(&parsed, &command) else {
+            panic!("shell prefix must not affect direct classification");
+        };
+        assert!(matched.is_implicit());
+        assert_eq!(matched.prefix_rule_source(), None);
+
+        let shell_matches = shell_prefix_matches(&parsed, &command);
+        assert_eq!(shell_matches.len(), 1);
+        assert_eq!(shell_matches[0].rule_source(), "bash -c");
+        assert_eq!(shell_matches[0].parts_consumed(), 2);
     }
 
     #[test]

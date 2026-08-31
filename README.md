@@ -19,12 +19,17 @@ mkdir -p ~/config
 cp ./saferun.yaml ~/config/saferun.yaml
 ```
 
-The YAML config has four rule lists:
+The YAML config has five rule lists:
 
 ```yaml
 prefixes:
-  - "env *"
+  - "env *=*"
   - "sudo"
+
+shell_prefixes:
+  - "bash -c"
+  - "/bin/bash -c"
+  - "/bin/zsh -lc"
 
 allow:
   - "git status"
@@ -42,7 +47,8 @@ deny:
 
 `allow` must contain at least one entry. The other lists are optional:
 
-- `prefixes` recognizes leading wrappers such as `env` or `sudo` and strips them before `ask` and `allow` matching. Deny still checks both the full command and each stripped remainder.
+- `prefixes` recognizes leading wrappers such as `env` assignments or `sudo` and strips them before `ask` and `allow` matching. Deny still checks both the full command and each stripped remainder. For `env`, prefer assignment-shaped rules such as `env *=*` so non-assignment command words are not consumed as prefix arguments.
+- `shell_prefixes` recognizes explicit shell invocations whose payload should be inspected. Only configured variants are parsed; ordinary `prefixes` remain argv-only, but they can wrap a configured shell prefix.
 - `allow` executes matching commands without prompting.
 - `ask` requires interactive approval before execution.
 - `deny` blocks matching commands without prompting.
@@ -56,6 +62,12 @@ Rules are shell-split with `shlex` and matched case-insensitively against argv:
 - `ask` and `allow` rules permit trailing argv items.
 
 The `sed` rule above matches both `sed -n 1,20p` and `sed -n /start/,/end/p`; each `*` stays within one argv item. Quote rules containing `*` so YAML does not treat them as aliases.
+
+When a configured `shell_prefixes` rule leaves exactly one payload argument, `saferun` parses that payload and authorizes each top-level literal command joined by `|`, `&&`, or `;` in source order. Static stdout `>` and `>>` redirections at the end of a literal command are authorized as separate redirection parts, such as `> out.log`, `> /dev/null`, or `>> out.log`. A static fd-2 overwrite redirect to the literal `/dev/null`, such as `2>/dev/null` or `2> /dev/null`, is ignored for authorization and does not create a prompt, including when it starts a command immediately after a supported separator such as `;`, `|`, or `&&`. A literal fd-2 duplication to stdout, written as `2>&1` with optional spaces or tabs between `&` and `1`, is also ignored for authorization. Tilde-bearing command words and arguments are authorized as literal argv text, so `ls ~/.codex/` is checked as `ls '~/.codex/'`. Simple shell variable and parameter references in command words and arguments are also authorized as literal argv text, so `curl --data "$REQUEST" https://api.example.test` is checked as `curl --data '$REQUEST' https://api.example.test`, and normal `*`/`**` policy matching applies to those literal argv parts. It still executes the original shell argv unchanged, and only after every remaining part is authorized, so the shell applies its normal tilde behavior, variable expansion, word splitting, globbing, and redirection ordering at runtime. Quoted or escaped separators stay part of the surrounding argument.
+
+Unsupported shell syntax is not auto-allowed. Dynamic or unsupported redirection forms, command substitutions, backtick substitutions, process substitutions, arithmetic expansions, complex or malformed parameter expansions, globs, `||`, backgrounding, newlines, assignments, control flow, grouping, functions, heredocs, malformed syntax, and shell invocations with extra argv are treated as opaque implicit asks. Assignment prefixes such as `FOO=$BAR command` remain opaque. Unsupported redirections include fd-specific redirects other than the exact static stderr discard and exact fd-2-to-fd-1 duplication above, such as `2> file`, `2>>/dev/null`, `1>&2`, `2>&2`, or `2>&$fd`, non-stdout operators such as `>|` or `&>`, input redirects, variable/substitution/glob/tilde-expansion targets such as `> "$OUT"` or `> ~/out.log`, assignment-shaped tilde-expansion targets such as `> FOO=~/out.log` or `> PATH=abc:~/out.log`, and redirections with non-target arguments after the target. Opaque requests are sent to the approval UI as one quoted string, so a session grant applies to that exact fragment rather than to `bash` or `zsh` broadly.
+
+Before any approval prompt, `saferun` checks the original invocation and all statically extracted commands, including commands inside opaque constructs, against `deny`. Any attempt to run a child command whose executable basename is `saferun` is denied without prompting, including paths such as `./saferun`, case variants such as `SaFeRuN`, and commands behind a recognized generic prefix. This intentionally reserves the `saferun` command name inside `saferun`; executable identity is not resolved through `PATH`, symlinks, variables, or canonical paths. A command-position variable such as `$TOOL --version` is checked literally as `$TOOL --version`; deny and nested-command scans cannot infer the executable that the shell may run after expansion. Any configured shell prefix found inside a parsed shell payload is also denied without prompting.
 
 ## Starting the Approver
 
@@ -79,22 +91,26 @@ The broker listens only on `/tmp/saferun-<effective-uid>/approval.sock`. Live `a
 
 - every prefix of the effective command, starting with its executable
 - `Matched ask rule` for a configured `ask` match
+- `Allow all commands in this session`
 
 The effective command is argv after stripping a recognized configured prefix. Approving the executable for `env X=1 python3 -c first` also approves `python3 -c second` and `env Y=2 python3 -c third`, but not `ruby -e …`.
 
-Shell payloads remain opaque. For `/bin/zsh -lc 'cargo test'`, the quoted payload is one argv item and is never parsed.
+For parsed shell payloads, each component is approved independently. For `/bin/zsh -lc 'cargo test; git push origin main'`, a policy can allow `cargo test` while prompting for `git push origin main`; the shell command itself runs only if both parts are authorized. For `/bin/zsh -lc 'printf hi >> out.log'`, `printf hi` and `>> out.log` are approved separately.
 
-Session grants follow the agent token across working directories and equivalent config files. They are keyed by agent token, policy digest, and selected scope. A broker restart, key change, policy change, or cache eviction requires approval again.
+For redirection approval prompts, the default session scope is the exact redirection unit, such as `>> out.log`, not the bare operator `>>`. Broader redirection session approval is still possible only through an explicit matched ask rule or `Allow all commands in this session`.
+
+Session grants follow the agent token across working directories and equivalent config files. They are keyed by agent token, policy digest, and selected scope. `Allow all commands in this session` approves future approval prompts for the same agent token and current policy digest. A broker restart, key change, policy change, or cache eviction requires approval again.
 
 ## AI Agent Setup
 
 Create one token file per agent session and retain its path:
 
 ```bash
-export SAFERUN_TOKEN_FILE="$(saferun session-token)"
+token_file="$(saferun session-token)"
+saferun -t "$token_file" -- git status
 ```
 
-`saferun session-token` creates a `0600` file in the UID-owned `0700` runtime directory and prints only its non-secret path. It does not load policy or require an existing token. `saferun` validates and reads the file, then removes `SAFERUN_TOKEN_FILE` before executing the command. Never put token contents in environment values, argv, or stdin.
+`saferun session-token` creates a `0600` file in the UID-owned `0700` runtime directory and prints only its non-secret path. It does not load policy or require an existing token. `saferun` validates and reads the file passed as `-t TOKEN_FILE`. The path is non-secret and visible in saferun's argv while it runs, but `-t` and its value are consumed by `saferun` and are not forwarded to the authorized child's argv or environment. Never put token contents in environment values, argv, or stdin.
 
 Add this policy to `~/.codex/AGENTS.md` or `~/.claude/CLAUDE.md`:
 
@@ -104,12 +120,13 @@ Add this policy to `~/.codex/AGENTS.md` or `~/.claude/CLAUDE.md`:
 Run every shell command through `saferun` so it is checked against `~/config/saferun.yaml`.
 
 ```bash
-saferun -- git status
-saferun -- cargo test
-saferun -- kubectl -n monitoring get pods
+token_file="$(saferun session-token)"
+saferun -t "$token_file" -- git status
+saferun -t "$token_file" -- cargo test
+saferun -t "$token_file" -- kubectl -n monitoring get pods
 ```
 
-When printing commands for the user, omit `saferun --`. Commands run by the agent must retain it.
+When printing commands for the user, omit the `saferun` wrapper. Commands run by the agent must retain it.
 ````
 
 Restrict the agent's native shell permissions to `saferun`.
@@ -135,21 +152,21 @@ This is a cooperative boundary between sibling agents under one Unix account. Di
 ## Usage
 
 ```bash
-saferun -- <command> [args...]
+saferun [-h] [--config CONFIG] [-t TOKEN_FILE] [--dry-run] [--explain] -- <command> [args...]
 ```
 
 Examples:
 
 ```bash
-saferun -- git status
-saferun -- cargo test
-saferun -- kubectl -n monitoring get pods
+saferun -t "$token_file" -- git status
+saferun -t "$token_file" -- cargo test
+saferun -t "$token_file" -- kubectl -n monitoring get pods
 ```
 
 Select another policy with `--config` or `-c`:
 
 ```bash
-saferun --config ./saferun.yaml -- git status
+saferun -t "$token_file" --config ./saferun.yaml -- git status
 ```
 
 ## Checking Rules
@@ -166,11 +183,29 @@ Allowed commands print `ALLOW`; configured and implicit asks print `ASK`. Both e
 `--explain` prints the matching rule before execution:
 
 ```bash
-saferun --explain -- git status
-saferun --explain -- git push origin main
+saferun -t "$token_file" --explain -- git status
+saferun -t "$token_file" --explain -- git push origin main
 ```
 
 Approved asks report `approval='once'` or `approval='session'`; the selected session scope is not part of the response.
+
+For parsed shell payloads, `--dry-run` and `--explain` print each part before the aggregate decision:
+
+```text
+PART 1/2 ALLOW cargo test (allow='cargo test')
+PART 2/2 ASK git push origin main (ask='git push **')
+ASK /bin/zsh -lc 'cargo test; git push origin main' (shell_parts=2)
+```
+
+Redirection parts appear in the same list:
+
+```text
+PART 1/2 ALLOW printf hi (allow='printf hi')
+PART 2/2 ASK >> out.log (ask='>> **')
+ASK /bin/zsh -lc 'printf hi >> out.log' (shell_parts=2)
+```
+
+In a live `--explain` run, approved ask parts are reported as `ALLOW` with `approval='once'` or `approval='session'`, and the aggregate shell invocation is reported as `ALLOW` before execution.
 
 The panel title is `saferun in <directory>`. Its body lists each argv item on a numbered, unquoted, reversible byte-safe line: `Prefix N` for a recognized configured prefix and `Command N` for the effective command. Rule metadata and the eight-character session fingerprint follow. Control characters, invalid UTF-8, and bidi controls are escaped. The scope dropdown sits beside `Allow for session`.
 
@@ -201,6 +236,6 @@ cargo test
 - `126`: command denied, approval unavailable/denied/failed, or execution failed
 - `127`: authorized command not found
 
-An actual ask without `SAFERUN_TOKEN_FILE` fails closed. The token must be an owned `0600` regular file in the UID-owned `0700` runtime directory containing exactly 64 ASCII hexadecimal bytes and an optional final LF.
+An actual ask without `-t TOKEN_FILE` fails closed. The token must be an owned `0600` regular file in the UID-owned `0700` runtime directory containing exactly 64 ASCII hexadecimal bytes and an optional final LF.
 
-Authorized commands run through Unix `exec`, preserving PID and stdio without exposing the token-file path.
+Authorized commands run through Unix `exec`, preserving PID and stdio; the authorized child never receives `-t` or the token-file path.

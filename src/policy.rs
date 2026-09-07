@@ -649,6 +649,38 @@ mod tests {
     }
 
     #[test]
+    fn input_stars_are_data_for_normal_star_and_globstar_rules() {
+        let parsed = policy("allow:\n  - cat migrations/*.go\n  - one *\n  - recursive ** done\n");
+
+        let PolicyDecision::Allow(cat_match) =
+            classify(&parsed, &argv(&["cat", "migrations/*.go"]))
+        else {
+            panic!("cat glob argument must match literal argv");
+        };
+        assert_eq!(cat_match.rule_source(), "cat migrations/*.go");
+
+        let PolicyDecision::Allow(one_part_match) = classify(&parsed, &argv(&["one", "a*b**c"]))
+        else {
+            panic!("single-part wildcard must match a literal star-bearing argv item");
+        };
+        assert_eq!(one_part_match.rule_source(), "one *");
+
+        let PolicyDecision::Allow(multi_part_match) =
+            classify(&parsed, &argv(&["recursive", "a*", "b**c", "done"]))
+        else {
+            panic!("globstar wildcard must match multiple literal star-bearing argv items");
+        };
+        assert_eq!(multi_part_match.rule_source(), "recursive ** done");
+
+        let PolicyDecision::Ask(unmatched) =
+            classify(&parsed, &argv(&["cat", "migrations", "main.go"]))
+        else {
+            panic!("literal input star must not expand into more argv for policy matching");
+        };
+        assert!(unmatched.is_implicit());
+    }
+
+    #[test]
     fn implicit_ask_preserves_recognized_prefix_boundary() {
         let parsed = policy("prefixes:\n  - env *\nallow:\n  - /bin/true\n");
         let PolicyDecision::Ask(matched) =

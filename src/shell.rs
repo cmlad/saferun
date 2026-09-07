@@ -1,6 +1,4 @@
-use agent_shell_parser::parse::{
-    parse_with_substitutions, Operator, ParsedPipeline, ShellSegment, Word, WordKind,
-};
+use agent_shell_parser::parse::{parse_with_substitutions, Operator, ParsedPipeline, ShellSegment};
 
 use crate::policy::{
     configured_prefix_remainders, shell_prefix_matches, shlex_join, shlex_quote, Policy,
@@ -211,15 +209,13 @@ fn units_from_segment(segment: &ShellSegment) -> Vec<ShellCommandUnit> {
         return vec![opaque(command)];
     }
 
-    if !has_authorizable_command_words(segment) {
+    if !segment.substitutions.is_empty() {
         return vec![opaque(command)];
     }
 
     if segment.redirection.is_none() {
-        if is_literal_simple_command_source(analysis_command) {
-            if let Some(argv) = shlex::split(analysis_command) {
-                return vec![ShellCommandUnit::Parsed(argv)];
-            }
+        if let Some(argv) = literal_command_argv(analysis_command) {
+            return vec![ShellCommandUnit::Parsed(argv)];
         }
         if let Some((argv, redirection)) = supported_static_redirection(segment, analysis_command) {
             return vec![ShellCommandUnit::Parsed(argv), redirection];
@@ -238,25 +234,19 @@ fn opaque(command: &str) -> ShellCommandUnit {
     ShellCommandUnit::Opaque(shlex_quote(command))
 }
 
-fn has_authorizable_command_words(segment: &ShellSegment) -> bool {
-    segment.substitutions.is_empty()
-        && !segment.words.is_empty()
-        && !segment
-            .words
-            .iter()
-            .any(|word| word.is_assignment() || has_unsupported_word_expansion(word))
-}
-
-fn has_unsupported_word_expansion(word: &Word) -> bool {
-    match word.kind() {
-        WordKind::Literal | WordKind::VariableExpansion => false,
-        WordKind::Unclassified => word.is_expansion(),
-        WordKind::CommandSubstitution | WordKind::ArithmeticExpansion | WordKind::Dynamic => true,
-    }
-}
-
 fn is_literal_simple_command_source(command: &str) -> bool {
     !has_unsupported_command_word_meta(command)
+}
+
+fn literal_command_argv(command: &str) -> Option<Vec<String>> {
+    if !is_literal_simple_command_source(command) {
+        return None;
+    }
+    let argv = shlex::split(command)?;
+    if argv.is_empty() || argv.iter().any(|part| is_assignment(part)) {
+        return None;
+    }
+    Some(argv)
 }
 
 fn supported_static_redirection(
@@ -264,13 +254,7 @@ fn supported_static_redirection(
     command: &str,
 ) -> Option<(Vec<String>, ShellCommandUnit)> {
     let split = split_supported_redirection_suffix(command.trim())?;
-    if !is_literal_simple_command_source(split.command) {
-        return None;
-    }
-    let argv = shlex::split(split.command)?;
-    if argv.is_empty() {
-        return None;
-    }
+    let argv = literal_command_argv(split.command)?;
     let target = static_redirection_target(split.target)?;
 
     match segment.redirection.as_ref() {
@@ -816,7 +800,7 @@ fn has_unsupported_command_word_meta(value: &str) -> bool {
                 };
                 index = end;
             }
-            '*' | '?' | '[' | '{' | '}' | '|' | '&' | ';' | '(' | ')' | '<' | '>'
+            '?' | '[' | '{' | '}' | '|' | '&' | ';' | '(' | ')' | '<' | '>'
                 if !single_quoted && !double_quoted =>
             {
                 return true;
@@ -1056,6 +1040,41 @@ mod tests {
                 "printf".into(),
                 "*?[abc]".into()
             ])]
+        );
+    }
+
+    #[test]
+    fn active_star_glob_characters_stay_literal_arguments() {
+        assert_eq!(
+            unit_strings(&[
+                "bash",
+                "-c",
+                r#"cat migrations/*.go; printf a*b ** *** ~/*.log "$DIR"/*.go \*"#,
+            ]),
+            vec![
+                ShellCommandUnit::Parsed(vec!["cat".into(), "migrations/*.go".into()]),
+                ShellCommandUnit::Parsed(vec![
+                    "printf".into(),
+                    "a*b".into(),
+                    "**".into(),
+                    "***".into(),
+                    "~/*.log".into(),
+                    "$DIR/*.go".into(),
+                    "*".into(),
+                ]),
+            ]
+        );
+    }
+
+    #[test]
+    fn active_star_in_command_position_stays_literal() {
+        assert_eq!(
+            unit_strings(&["bash", "-c", "* --version; */tool run; safe*run status"]),
+            vec![
+                ShellCommandUnit::Parsed(vec!["*".into(), "--version".into()]),
+                ShellCommandUnit::Parsed(vec!["*/tool".into(), "run".into()]),
+                ShellCommandUnit::Parsed(vec!["safe*run".into(), "status".into()]),
+            ]
         );
     }
 
@@ -1507,6 +1526,8 @@ mod tests {
             "echo ${}",
             "echo $",
             "echo $:",
+            "echo $(date)*",
+            "echo ${VAR:-default}*.go",
         ] {
             let units = unit_strings(&["bash", "-c", script]);
             assert_eq!(units.len(), 1, "{script:?}");
@@ -1597,10 +1618,12 @@ mod tests {
             "echo hi &> /dev/null",
             "echo hi > file extra",
             "echo ~/$(date)",
+            "echo ?",
+            "echo [abc]",
+            "echo file[0-9].go",
+            "echo *?[abc]",
             "echo {a,b}",
             "r{m,} target",
-            "echo ~/*.log",
-            "echo *",
             "cargo test || git status",
             "sleep 1 & git status",
             "if true; then echo ok; fi",

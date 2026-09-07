@@ -263,6 +263,63 @@ fn shell_dry_run_authorizes_variable_as_literal_argument() {
 }
 
 #[test]
+fn shell_dry_run_authorizes_star_glob_as_literal_argument() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = temp.path().join("saferun.yaml");
+    std::fs::write(
+        &config,
+        "shell_prefixes: ['bash -c']\nallow:\n  - cat migrations/*.go\n",
+    )
+    .expect("write config");
+    let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
+        .args(["--config"])
+        .arg(&config)
+        .args(["--dry-run", "--", "bash", "-c", "cat migrations/*.go"])
+        .output()
+        .expect("run saferun");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"PART 1/1 ALLOW cat 'migrations/*.go' (allow='cat migrations/*.go')\n\
+          ALLOW bash -c 'cat migrations/*.go' (shell_parts=1)\n"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
+fn shell_dry_run_keeps_question_and_bracket_globs_opaque() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = temp.path().join("saferun.yaml");
+    std::fs::write(
+        &config,
+        "shell_prefixes: ['bash -c']\nallow:\n  - cat **\nask:\n  - '**'\n",
+    )
+    .expect("write config");
+    let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
+        .args(["--config"])
+        .arg(&config)
+        .args([
+            "--dry-run",
+            "--",
+            "bash",
+            "-c",
+            "cat migrations/?.go; cat migrations/[ab].go",
+        ])
+        .output()
+        .expect("run saferun");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"PART 1/2 ASK 'cat migrations/?.go' (ask='<no matched rule>')\n\
+          PART 2/2 ASK 'cat migrations/[ab].go' (ask='<no matched rule>')\n\
+          ASK bash -c 'cat migrations/?.go; cat migrations/[ab].go' (shell_parts=2)\n"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
 fn shell_dry_run_prints_redirection_parts() {
     let temp = tempfile::tempdir().expect("tempdir");
     let config = temp.path().join("saferun.yaml");
@@ -840,6 +897,53 @@ fn shell_invocation_executes_original_variable_expansion_after_literal_authoriza
 
     assert!(output.status.success(), "{output:?}");
     assert_eq!(output.stdout, b"[runtime value]");
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
+fn shell_invocation_executes_original_star_glob_after_literal_authorization() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("a.go"), "").expect("write a");
+    std::fs::write(temp.path().join("b.go"), "").expect("write b");
+    std::fs::write(temp.path().join("c.txt"), "").expect("write c");
+    let config = temp.path().join("saferun.yaml");
+    std::fs::write(
+        &config,
+        "shell_prefixes: ['/bin/bash -c']\nallow:\n  - printf '[%s]' *.go\n",
+    )
+    .expect("write config");
+    let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
+        .current_dir(temp.path())
+        .args(["--config"])
+        .arg(&config)
+        .args(["--", "/bin/bash", "-c", "printf '[%s]' *.go"])
+        .output()
+        .expect("run saferun");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"[a.go][b.go]");
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
+fn shell_invocation_executes_original_no_match_star_glob_after_literal_authorization() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = temp.path().join("saferun.yaml");
+    std::fs::write(
+        &config,
+        "shell_prefixes: ['/bin/bash -c']\nallow:\n  - printf '[%s]' *.nomatch\n",
+    )
+    .expect("write config");
+    let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
+        .current_dir(temp.path())
+        .args(["--config"])
+        .arg(&config)
+        .args(["--", "/bin/bash", "-c", "printf '[%s]' *.nomatch"])
+        .output()
+        .expect("run saferun");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"[*.nomatch]");
     assert!(output.stderr.is_empty(), "{output:?}");
 }
 

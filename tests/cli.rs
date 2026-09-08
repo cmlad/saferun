@@ -320,6 +320,37 @@ fn shell_dry_run_keeps_question_and_bracket_globs_opaque() {
 }
 
 #[test]
+fn shell_dry_run_authorizes_ansi_c_quoted_literals() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = temp.path().join("saferun.yaml");
+    std::fs::write(
+        &config,
+        "shell_prefixes: ['bash -c']\nallow:\n  - printf **\ndeny:\n  - date **\n",
+    )
+    .expect("write config");
+    let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
+        .args(["--config"])
+        .arg(&config)
+        .args([
+            "--dry-run",
+            "--",
+            "bash",
+            "-c",
+            r#"printf $'${TOOL} $(date) *.go \x2a' "$HOME""#,
+        ])
+        .output()
+        .expect("run saferun");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"PART 1/1 ALLOW printf '${TOOL} $(date) *.go *' '$HOME' (allow='printf **')\n\
+          ALLOW bash -c 'printf $'\"'\"'${TOOL} $(date) *.go \\x2a'\"'\"' \"$HOME\"' (shell_parts=1)\n"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
 fn shell_dry_run_prints_redirection_parts() {
     let temp = tempfile::tempdir().expect("tempdir");
     let config = temp.path().join("saferun.yaml");
@@ -944,6 +975,34 @@ fn shell_invocation_executes_original_no_match_star_glob_after_literal_authoriza
 
     assert!(output.status.success(), "{output:?}");
     assert_eq!(output.stdout, b"[*.nomatch]");
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
+fn shell_invocation_executes_original_ansi_c_quoted_literals_after_authorization() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = temp.path().join("saferun.yaml");
+    std::fs::write(
+        &config,
+        "shell_prefixes: ['/bin/bash -c']\nallow:\n  - printf **\n",
+    )
+    .expect("write config");
+    let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
+        .current_dir(temp.path())
+        .env("HOME", "runtime-home")
+        .args(["--config"])
+        .arg(&config)
+        .args([
+            "--",
+            "/bin/bash",
+            "-c",
+            r#"printf '[%s]' $'two words' $'*.go' "$HOME""#,
+        ])
+        .output()
+        .expect("run saferun");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"[two words][*.go][runtime-home]");
     assert!(output.stderr.is_empty(), "{output:?}");
 }
 

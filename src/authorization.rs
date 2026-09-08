@@ -1682,6 +1682,56 @@ mod tests {
     }
 
     #[test]
+    fn shell_ansi_c_quoted_argument_matches_literal_policy_without_approval() {
+        let (_directory, config, policy) =
+            policy("shell_prefixes: ['bash -c']\nallow:\n  - printf **\ndeny:\n  - date **\n");
+        let client = QueueClient::new([Err("must not be called")]);
+        let command = argv(&[
+            "bash",
+            "-c",
+            r#"printf $'${TOOL} $(date) *.go \x2a' "$HOME""#,
+        ]);
+        let outcome = authorize_invocation(&policy, &command, &config, false, None, &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Execute {
+            aggregate_kind,
+            units,
+        }) = outcome
+        else {
+            panic!("expected shell execution");
+        };
+        assert_eq!(aggregate_kind, AuthorizationKind::Allow);
+        assert_eq!(units.len(), 1);
+        assert_eq!(
+            units[0].unit,
+            ShellCommandUnit::Parsed(argv(&["printf", "${TOOL} $(date) *.go *", "$HOME"]))
+        );
+        assert_eq!(units[0].kind, AuthorizationKind::Allow);
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn shell_real_substitution_after_ansi_c_quote_still_denies_before_prompting() {
+        let (_directory, config, policy) =
+            policy("shell_prefixes: ['bash -c']\nallow:\n  - printf **\ndeny:\n  - date **\n");
+        let client = QueueClient::new([approved(ApprovalScope::Once)]);
+        let command = argv(&["bash", "-c", r#"printf $'literal' $(date)"#]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[5; 32]), &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
+            diagnostic: None,
+            units,
+        }) = outcome
+        else {
+            panic!("expected shell denial");
+        };
+        assert_eq!(units.len(), 1);
+        assert!(matches!(units[0].unit, ShellCommandUnit::Opaque(_)));
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
     fn shell_variable_arguments_use_normal_star_matching() {
         let (_directory, config, policy) =
             policy("shell_prefixes: ['bash -c']\nallow:\n  - printf *\nask:\n  - printf **\n");

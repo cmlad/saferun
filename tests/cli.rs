@@ -1007,6 +1007,33 @@ fn shell_invocation_executes_original_ansi_c_quoted_literals_after_authorization
 }
 
 #[test]
+fn shell_invocation_executes_original_ansi_c_control_escapes_after_authorization() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = temp.path().join("saferun.yaml");
+    std::fs::write(
+        &config,
+        "shell_prefixes: ['/bin/bash -c']\nallow:\n  - printf **\n",
+    )
+    .expect("write config");
+    let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
+        .current_dir(temp.path())
+        .args(["--config"])
+        .arg(&config)
+        .args([
+            "--",
+            "/bin/bash",
+            "-c",
+            r#"printf '[%s]' $'\cA' $'\ca' $'\c?'"#,
+        ])
+        .output()
+        .expect("run saferun");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"[\x01][\x01][\x1f]");
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
 fn shell_invocation_executes_original_stderr_dev_null_redirection_after_parts_are_allowed() {
     let temp = tempfile::tempdir().expect("tempdir");
     let config = temp.path().join("saferun.yaml");

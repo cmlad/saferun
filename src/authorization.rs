@@ -1732,6 +1732,84 @@ mod tests {
     }
 
     #[test]
+    fn shell_ansi_c_decoded_nested_saferun_is_denied_before_prompting() {
+        let (_directory, config, policy) =
+            policy("shell_prefixes: ['bash -c']\nallow:\n  - saferun **\nask:\n  - '**'\n");
+        let client = QueueClient::new([approved(ApprovalScope::Once)]);
+        let command = argv(&["bash", "-c", r#"$'\x73aferun' --dry-run -- git status"#]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[8; 32]), &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
+            diagnostic: Some(message),
+            units,
+        }) = outcome
+        else {
+            panic!("expected nested saferun denial");
+        };
+        assert_eq!(
+            message,
+            "saferun: nested saferun invocation is not permitted: saferun --dry-run -- git status"
+        );
+        assert_eq!(units.len(), 1);
+        assert_eq!(
+            units[0].unit,
+            ShellCommandUnit::Parsed(argv(&["saferun", "--dry-run", "--", "git", "status"]))
+        );
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn shell_ansi_c_decoded_nested_configured_shell_is_denied_before_prompting() {
+        let (_directory, config, policy) =
+            policy("shell_prefixes: ['bash -c']\nallow:\n  - git status\nask:\n  - '**'\n");
+        let client = QueueClient::new([approved(ApprovalScope::Once)]);
+        let command = argv(&["bash", "-c", r#"$'\x62ash' -c 'git status'"#]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[8; 32]), &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
+            diagnostic: Some(message),
+            units,
+        }) = outcome
+        else {
+            panic!("expected nested shell denial");
+        };
+        assert_eq!(
+            message,
+            "saferun: nested shell invocation is not permitted: bash -c 'git status'"
+        );
+        assert_eq!(units.len(), 1);
+        assert_eq!(
+            units[0].unit,
+            ShellCommandUnit::Parsed(argv(&["bash", "-c", "git status"]))
+        );
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn shell_ansi_c_decoded_opaque_denied_command_is_denied_before_prompting() {
+        let (_directory, config, policy) =
+            policy("shell_prefixes: ['bash -c']\nallow:\n  - git status\ndeny:\n  - rm **\nask:\n  - '**'\n");
+        let client = QueueClient::new([approved(ApprovalScope::Once)]);
+        let command = argv(&["bash", "-c", r#"$'\x72m' target $(date)"#]);
+        let outcome =
+            authorize_invocation(&policy, &command, &config, false, Some(&[8; 32]), &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
+            diagnostic: None,
+            units,
+        }) = outcome
+        else {
+            panic!("expected decoded static deny");
+        };
+        assert_eq!(units.len(), 1);
+        assert!(matches!(units[0].unit, ShellCommandUnit::Opaque(_)));
+        assert_eq!(units[0].kind, AuthorizationKind::Ask);
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
     fn shell_variable_arguments_use_normal_star_matching() {
         let (_directory, config, policy) =
             policy("shell_prefixes: ['bash -c']\nallow:\n  - printf *\nask:\n  - printf **\n");

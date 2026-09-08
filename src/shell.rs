@@ -309,21 +309,37 @@ fn next_ignored_authorization_redirection(
     let mut double_quoted = false;
     let mut escaped = false;
 
-    for (offset, character) in command[search_start..].char_indices() {
-        let index = search_start + offset;
+    let mut index = search_start;
+    while let Some((character, next_index)) = char_at(command, index) {
         if escaped {
             escaped = false;
+            index = next_index;
             continue;
         }
         match character {
-            '\\' if !single_quoted => escaped = true,
-            '\'' if !double_quoted => single_quoted = !single_quoted,
-            '"' if !single_quoted => double_quoted = !double_quoted,
+            '\\' if !single_quoted => {
+                escaped = true;
+                index = next_index;
+            }
+            '\'' if !double_quoted => {
+                single_quoted = !single_quoted;
+                index = next_index;
+            }
+            '"' if !single_quoted => {
+                double_quoted = !double_quoted;
+                index = next_index;
+            }
+            '$' if !single_quoted && !double_quoted && command[next_index..].starts_with('\'') => {
+                index = ansi_c_quote_source_end(command, next_index)?;
+                continue;
+            }
             '>' if !single_quoted && !double_quoted => {
                 let Some((fd_start, fd)) = explicit_redirection_fd(command, index) else {
+                    index = next_index;
                     continue;
                 };
                 if fd != "2" {
+                    index = next_index;
                     continue;
                 }
                 match command[index + 1..].chars().next() {
@@ -337,7 +353,10 @@ fn next_ignored_authorization_redirection(
                             });
                         }
                     }
-                    Some('>' | '|') => continue,
+                    Some('>' | '|') => {
+                        index = next_index;
+                        continue;
+                    }
                     _ => {
                         let target_start = skip_horizontal_whitespace(command, index + 1);
                         let target_end = redirection_target_end(command, target_start)?;
@@ -350,8 +369,9 @@ fn next_ignored_authorization_redirection(
                         }
                     }
                 }
+                index = next_index;
             }
-            _ => {}
+            _ => index = next_index,
         }
     }
 
@@ -413,19 +433,39 @@ fn is_active_shell_syntax_at(command: &str, target_index: usize) -> bool {
     let mut double_quoted = false;
     let mut escaped = false;
 
-    for (index, character) in command.char_indices() {
+    let mut index = 0;
+    while let Some((character, next_index)) = char_at(command, index) {
         if index == target_index {
             return !escaped && !single_quoted && !double_quoted;
         }
         if escaped {
             escaped = false;
+            index = next_index;
             continue;
         }
         match character {
-            '\\' if !single_quoted => escaped = true,
-            '\'' if !double_quoted => single_quoted = !single_quoted,
-            '"' if !single_quoted => double_quoted = !double_quoted,
-            _ => {}
+            '\\' if !single_quoted => {
+                escaped = true;
+                index = next_index;
+            }
+            '\'' if !double_quoted => {
+                single_quoted = !single_quoted;
+                index = next_index;
+            }
+            '"' if !single_quoted => {
+                double_quoted = !double_quoted;
+                index = next_index;
+            }
+            '$' if !single_quoted && !double_quoted && command[next_index..].starts_with('\'') => {
+                let Some(end) = ansi_c_quote_source_end(command, next_index) else {
+                    return false;
+                };
+                if target_index < end {
+                    return false;
+                }
+                index = end;
+            }
+            _ => index = next_index,
         }
     }
 
@@ -497,35 +537,52 @@ fn split_supported_redirection_suffix(command: &str) -> Option<RedirectionSplit<
     let mut escaped = false;
     let mut found = None;
 
-    let mut chars = command.char_indices().peekable();
-    while let Some((index, character)) = chars.next() {
+    let mut index = 0;
+    while let Some((character, next_index)) = char_at(command, index) {
         if escaped {
             escaped = false;
+            index = next_index;
             continue;
         }
         match character {
-            '\\' if !single_quoted => escaped = true,
-            '\'' if !double_quoted => single_quoted = !single_quoted,
-            '"' if !single_quoted => double_quoted = !double_quoted,
+            '\\' if !single_quoted => {
+                escaped = true;
+                index = next_index;
+            }
+            '\'' if !double_quoted => {
+                single_quoted = !single_quoted;
+                index = next_index;
+            }
+            '"' if !single_quoted => {
+                double_quoted = !double_quoted;
+                index = next_index;
+            }
+            '$' if !single_quoted && !double_quoted && command[next_index..].starts_with('\'') => {
+                index = ansi_c_quote_source_end(command, next_index)?;
+            }
             '<' if !single_quoted && !double_quoted => return None,
             '>' if !single_quoted && !double_quoted => {
+                let operator_index = index;
                 if command[..index].ends_with('&') {
                     return None;
                 }
-                let operator = match chars.peek().map(|(_, next)| *next) {
+                let operator = match char_at(command, next_index).map(|(next, _)| next) {
                     Some('>') => {
-                        chars.next();
+                        index = next_index + '>'.len_utf8();
                         ">>"
                     }
                     Some('|' | '&') => return None,
-                    _ => ">",
+                    _ => {
+                        index = next_index;
+                        ">"
+                    }
                 };
-                if found.is_some() || has_explicit_redirection_fd(command, index) {
+                if found.is_some() || has_explicit_redirection_fd(command, operator_index) {
                     return None;
                 }
-                found = Some((index, operator));
+                found = Some((operator_index, operator));
             }
-            _ => {}
+            _ => index = next_index,
         }
     }
 
@@ -712,14 +769,77 @@ fn segment_words(segment: &ShellSegment) -> Vec<String> {
 }
 
 fn static_commands(pipeline: &ParsedPipeline) -> Vec<Vec<String>> {
-    pipeline.filter_segments(&|segment| {
-        let words = segment_words(segment);
-        if words.is_empty() {
-            None
-        } else {
-            Some(words)
+    pipeline.filter_segments(&static_command_argv)
+}
+
+fn static_command_argv(segment: &ShellSegment) -> Option<Vec<String>> {
+    let mut words = segment_words(segment);
+    if words.is_empty() {
+        return None;
+    }
+
+    let command = segment.command.trim();
+    if segment.redirection.is_none() {
+        if let Some(argv) = split_static_authorization_argv(command, &segment.substitutions) {
+            if !argv.is_empty() {
+                return Some(argv);
+            }
         }
-    })
+    }
+
+    if let Some(command_word) = first_static_authorization_word(command) {
+        words[0] = command_word;
+    }
+
+    Some(words)
+}
+
+fn first_static_authorization_word(value: &str) -> Option<String> {
+    let end = first_shell_word_source_end(value)?;
+    let mut argv = split_literal_authorization_argv(&value[..end])?;
+    if argv.len() == 1 {
+        argv.pop()
+    } else {
+        None
+    }
+}
+
+fn first_shell_word_source_end(value: &str) -> Option<usize> {
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    let mut index = 0;
+
+    while let Some((character, next_index)) = char_at(value, index) {
+        if escaped {
+            escaped = false;
+            index = next_index;
+            continue;
+        }
+        match character {
+            '\\' if !single_quoted => {
+                escaped = true;
+                index = next_index;
+            }
+            '\'' if !double_quoted => {
+                single_quoted = !single_quoted;
+                index = next_index;
+            }
+            '"' if !single_quoted => {
+                double_quoted = !double_quoted;
+                index = next_index;
+            }
+            '$' if !single_quoted && !double_quoted && value[next_index..].starts_with('\'') => {
+                index = ansi_c_quote_source_end(value, next_index)?;
+            }
+            _ if !single_quoted && !double_quoted && is_shell_blank(character) => {
+                return Some(index);
+            }
+            _ => index = next_index,
+        }
+    }
+
+    (!single_quoted && !double_quoted && !escaped).then_some(value.len())
 }
 
 fn has_only_supported_top_level_operators(pipeline: &ParsedPipeline) -> bool {
@@ -820,12 +940,45 @@ fn has_unsupported_command_word_meta(value: &str) -> bool {
 }
 
 fn split_literal_authorization_argv(value: &str) -> Option<Vec<String>> {
+    split_authorization_argv(value, &[])
+}
+
+fn split_static_authorization_argv(
+    value: &str,
+    substitutions: &[agent_shell_parser::parse::SubstitutionSpan],
+) -> Option<Vec<String>> {
+    split_authorization_argv(value, substitutions)
+}
+
+fn split_authorization_argv(
+    value: &str,
+    substitutions: &[agent_shell_parser::parse::SubstitutionSpan],
+) -> Option<Vec<String>> {
     let mut argv = Vec::new();
     let mut current = String::new();
     let mut in_word = false;
     let mut index = 0;
+    let mut substitution_index = 0;
 
     while let Some((character, next_index)) = char_at(value, index) {
+        while substitutions
+            .get(substitution_index)
+            .is_some_and(|substitution| substitution.end <= index)
+        {
+            substitution_index += 1;
+        }
+
+        if let Some(substitution) = substitutions
+            .get(substitution_index)
+            .filter(|substitution| substitution.start == index)
+        {
+            in_word = true;
+            current.push_str(&value[substitution.start..substitution.end]);
+            index = substitution.end;
+            substitution_index += 1;
+            continue;
+        }
+
         if is_shell_blank(character) {
             if in_word {
                 argv.push(current);
@@ -847,11 +1000,23 @@ fn split_literal_authorization_argv(value: &str) -> Option<Vec<String>> {
                 index = push_single_quoted(value, next_index, &mut current)?;
             }
             '"' => {
-                index = push_double_quoted(value, next_index, &mut current)?;
+                index = push_double_quoted(
+                    value,
+                    next_index,
+                    substitutions,
+                    &mut substitution_index,
+                    &mut current,
+                )?;
             }
             '$' if value[next_index..].starts_with('\'') => {
                 index = push_ansi_c_quoted(value, next_index, &mut current)?;
             }
+            '$' => {
+                let end = allowed_parameter_reference_end(value, next_index)?;
+                current.push_str(&value[index..end]);
+                index = end;
+            }
+            '`' | '?' | '[' | '{' | '}' | '|' | '&' | ';' | '(' | ')' | '<' | '>' => return None,
             _ => {
                 current.push(character);
                 index = next_index;
@@ -877,8 +1042,31 @@ fn push_single_quoted(value: &str, mut index: usize, output: &mut String) -> Opt
     None
 }
 
-fn push_double_quoted(value: &str, mut index: usize, output: &mut String) -> Option<usize> {
+fn push_double_quoted(
+    value: &str,
+    mut index: usize,
+    substitutions: &[agent_shell_parser::parse::SubstitutionSpan],
+    substitution_index: &mut usize,
+    output: &mut String,
+) -> Option<usize> {
     while let Some((character, next_index)) = char_at(value, index) {
+        while substitutions
+            .get(*substitution_index)
+            .is_some_and(|substitution| substitution.end <= index)
+        {
+            *substitution_index += 1;
+        }
+
+        if let Some(substitution) = substitutions
+            .get(*substitution_index)
+            .filter(|substitution| substitution.start == index)
+        {
+            output.push_str(&value[substitution.start..substitution.end]);
+            index = substitution.end;
+            *substitution_index += 1;
+            continue;
+        }
+
         match character {
             '"' => return Some(next_index),
             '\\' => {
@@ -893,6 +1081,12 @@ fn push_double_quoted(value: &str, mut index: usize, output: &mut String) -> Opt
                 }
                 index = end;
             }
+            '$' => {
+                let end = allowed_parameter_reference_end(value, next_index)?;
+                output.push_str(&value[index..end]);
+                index = end;
+            }
+            '`' => return None,
             _ => {
                 output.push(character);
                 index = next_index;
@@ -929,6 +1123,21 @@ fn ansi_c_quote_end(value: &str, start_quote: usize) -> Option<usize> {
     push_ansi_c_quoted(value, start_quote, &mut scratch)
 }
 
+fn ansi_c_quote_source_end(value: &str, start_quote: usize) -> Option<usize> {
+    let (_, mut index) = char_at(value, start_quote)?;
+    while let Some((character, next_index)) = char_at(value, index) {
+        match character {
+            '\'' => return Some(next_index),
+            '\\' => {
+                let (_, end) = char_at(value, next_index)?;
+                index = end;
+            }
+            _ => index = next_index,
+        }
+    }
+    None
+}
+
 fn decode_ansi_c_escape(value: &str, start: usize) -> Option<(String, usize)> {
     let (character, next_index) = char_at(value, start)?;
     match character {
@@ -941,6 +1150,7 @@ fn decode_ansi_c_escape(value: &str, start: usize) -> Option<(String, usize)> {
         't' => Some(("\t".to_string(), next_index)),
         'v' => Some(("\x0b".to_string(), next_index)),
         '\\' | '\'' | '"' | '?' => Some((character.to_string(), next_index)),
+        'c' => decode_ansi_c_control_escape(value, next_index),
         'x' => decode_fixed_radix_escape(value, next_index, 16, 1, 2).and_then(byte_escape_string),
         'u' => {
             decode_fixed_radix_escape(value, next_index, 16, 4, 4).and_then(unicode_escape_string)
@@ -951,6 +1161,15 @@ fn decode_ansi_c_escape(value: &str, start: usize) -> Option<(String, usize)> {
         '0'..='7' => decode_fixed_radix_escape(value, start, 8, 1, 3).and_then(byte_escape_string),
         _ => Some((format!("\\{character}"), next_index)),
     }
+}
+
+fn decode_ansi_c_control_escape(value: &str, start: usize) -> Option<(String, usize)> {
+    let (character, next_index) = char_at(value, start)?;
+    if !character.is_ascii() {
+        return None;
+    }
+    let decoded = (character as u32) & 0x1f;
+    char::from_u32(decoded).map(|character| (character.to_string(), next_index))
 }
 
 fn decode_fixed_radix_escape(
@@ -1300,6 +1519,83 @@ mod tests {
         let units = unit_strings(&["bash", "-c", r#"printf $'literal' $(date)"#]);
         assert_eq!(units.len(), 1);
         assert!(matches!(units[0], ShellCommandUnit::Opaque(_)));
+    }
+
+    #[test]
+    fn static_commands_decode_ansi_c_command_words_for_preflight() {
+        let invocation = analyze(&[
+            "bash",
+            "-c",
+            concat!(
+                r#"$'\x73aferun' --dry-run -- git status; "#,
+                r#"$'\x62ash' -c 'git status'; "#,
+                r#"$'\x72m' target $(date)"#,
+            ),
+        ])
+        .expect("shell invocation");
+
+        assert_eq!(
+            invocation.static_commands,
+            vec![
+                vec![
+                    "saferun".to_string(),
+                    "--dry-run".to_string(),
+                    "--".to_string(),
+                    "git".to_string(),
+                    "status".to_string(),
+                ],
+                vec![
+                    "bash".to_string(),
+                    "-c".to_string(),
+                    "git status".to_string()
+                ],
+                vec!["date".to_string()],
+                vec![
+                    "rm".to_string(),
+                    "target".to_string(),
+                    "$(date)".to_string(),
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn ansi_c_quoted_stderr_redirection_text_stays_literal() {
+        assert_eq!(
+            unit_strings(&["bash", "-c", r#"printf $'A\' 2>/dev/null B'"#]),
+            vec![ShellCommandUnit::Parsed(vec![
+                "printf".into(),
+                "A' 2>/dev/null B".into(),
+            ])]
+        );
+        assert_eq!(
+            unit_strings(&["bash", "-c", r#"printf $'A\' 2>/dev/null B' 2>/dev/null"#]),
+            vec![ShellCommandUnit::Parsed(vec![
+                "printf".into(),
+                "A' 2>/dev/null B".into(),
+            ])]
+        );
+        assert_eq!(
+            unit_strings(&["bash", "-c", r#"printf $'A\' 2>&1 B' 2>&1"#]),
+            vec![ShellCommandUnit::Parsed(vec![
+                "printf".into(),
+                "A' 2>&1 B".into(),
+            ])]
+        );
+    }
+
+    #[test]
+    fn ansi_c_control_escapes_decode_and_check_boundaries() {
+        assert_eq!(
+            unit_strings(&["bash", "-c", r#"printf $'\cA' $'\ca' $'\c?' $'\cAB'"#,]),
+            vec![ShellCommandUnit::Parsed(vec![
+                "printf".into(),
+                "\x01".into(),
+                "\x01".into(),
+                "\x1f".into(),
+                "\x01B".into(),
+            ])]
+        );
     }
 
     #[test]
@@ -1756,6 +2052,9 @@ mod tests {
             "echo $'bad \\xgg escape'",
             "echo $'bad \\xff escape'",
             "echo $'bad \\0 escape'",
+            r#"echo $'\c'"#,
+            r#"echo $'\c@'"#,
+            r#"echo $'\cé'"#,
         ] {
             let units = unit_strings(&["bash", "-c", script]);
             assert_eq!(units.len(), 1, "{script:?}");

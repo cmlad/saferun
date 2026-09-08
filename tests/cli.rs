@@ -351,6 +351,31 @@ fn shell_dry_run_authorizes_ansi_c_quoted_literals() {
 }
 
 #[test]
+fn shell_dry_run_keeps_version_dependent_ansi_c_control_escape_opaque() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = temp.path().join("saferun.yaml");
+    std::fs::write(
+        &config,
+        "shell_prefixes: ['bash -c']\nallow:\n  - printf **\nask:\n  - '**'\n",
+    )
+    .expect("write config");
+    let output = Command::new(env!("CARGO_BIN_EXE_saferun"))
+        .args(["--config"])
+        .arg(&config)
+        .args(["--dry-run", "--", "bash", "-c", r#"printf $'\c?'"#])
+        .output()
+        .expect("run saferun");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"PART 1/1 ASK 'printf $'\"'\"'\\c?'\"'\"'' (ask='<no matched rule>')\n\
+          ASK bash -c 'printf $'\"'\"'\\c?'\"'\"'' (shell_parts=1)\n"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
 fn shell_dry_run_prints_redirection_parts() {
     let temp = tempfile::tempdir().expect("tempdir");
     let config = temp.path().join("saferun.yaml");

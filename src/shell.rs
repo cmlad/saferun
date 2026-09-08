@@ -1165,7 +1165,7 @@ fn decode_ansi_c_escape(value: &str, start: usize) -> Option<(String, usize)> {
 
 fn decode_ansi_c_control_escape(value: &str, start: usize) -> Option<(String, usize)> {
     let (character, next_index) = char_at(value, start)?;
-    if !character.is_ascii() {
+    if character == '?' || !character.is_ascii() {
         return None;
     }
     let decoded = (character as u32) & 0x1f;
@@ -1587,12 +1587,11 @@ mod tests {
     #[test]
     fn ansi_c_control_escapes_decode_and_check_boundaries() {
         assert_eq!(
-            unit_strings(&["bash", "-c", r#"printf $'\cA' $'\ca' $'\c?' $'\cAB'"#,]),
+            unit_strings(&["bash", "-c", r#"printf $'\cA' $'\ca' $'\cAB'"#,]),
             vec![ShellCommandUnit::Parsed(vec![
                 "printf".into(),
                 "\x01".into(),
                 "\x01".into(),
-                "\x1f".into(),
                 "\x01B".into(),
             ])]
         );
@@ -2053,6 +2052,7 @@ mod tests {
             "echo $'bad \\xff escape'",
             "echo $'bad \\0 escape'",
             r#"echo $'\c'"#,
+            r#"echo $'\c?'"#,
             r#"echo $'\c@'"#,
             r#"echo $'\cé'"#,
         ] {

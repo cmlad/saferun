@@ -1711,6 +1711,28 @@ mod tests {
     }
 
     #[test]
+    fn shell_version_dependent_ansi_c_control_escape_stays_opaque() {
+        let (_directory, config, policy) =
+            policy("shell_prefixes: ['bash -c']\nallow:\n  - printf **\nask:\n  - '**'\n");
+        let client = QueueClient::new([Err("must not be called")]);
+        let command = argv(&["bash", "-c", r#"printf $'\c?'"#]);
+        let outcome = authorize_invocation(&policy, &command, &config, true, None, &client);
+
+        let InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::DryRun {
+            aggregate_kind,
+            units,
+        }) = outcome
+        else {
+            panic!("expected shell dry-run");
+        };
+        assert_eq!(aggregate_kind, AuthorizationKind::Ask);
+        assert_eq!(units.len(), 1);
+        assert!(matches!(units[0].unit, ShellCommandUnit::Opaque(_)));
+        assert!(units[0].matched.is_implicit());
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
     fn shell_real_substitution_after_ansi_c_quote_still_denies_before_prompting() {
         let (_directory, config, policy) =
             policy("shell_prefixes: ['bash -c']\nallow:\n  - printf **\ndeny:\n  - date **\n");

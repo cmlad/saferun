@@ -1023,13 +1023,13 @@ fn shell_invocation_executes_original_ansi_c_control_escapes_after_authorization
             "--",
             "/bin/bash",
             "-c",
-            r#"printf '[%s]' $'\cA' $'\ca' $'\c?'"#,
+            r#"printf '[%s]' $'\cA' $'\ca' $'\cAB'"#,
         ])
         .output()
         .expect("run saferun");
 
     assert!(output.status.success(), "{output:?}");
-    assert_eq!(output.stdout, b"[\x01][\x01][\x1f]");
+    assert_eq!(output.stdout, b"[\x01][\x01][\x01B]");
     assert!(output.stderr.is_empty(), "{output:?}");
 }
 

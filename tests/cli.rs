@@ -880,7 +880,7 @@ fn nested_saferun_in_shell_payload_after_prefix_is_denied_with_diagnostic() {
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
         "saferun: nested saferun invocation is not permitted: saferun --dry-run -- git status\n\
-         PART 1/1 ASK 'env A=1 saferun --dry-run -- git status' (ask='<no matched rule>')\n\
+         PART 1/1 ASK env A=1 saferun --dry-run -- git status (prefix='env *', ask='**', prefix_parts_consumed=2)\n\
          DENIED bash -c 'env A=1 saferun --dry-run -- git status' (shell_parts=1)\n"
     );
 }

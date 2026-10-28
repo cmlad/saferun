@@ -1429,10 +1429,10 @@ mod tests {
             panic!("expected shell denial");
         };
         assert_eq!(units.len(), 2);
-        assert_eq!(units[0].kind, AuthorizationKind::Ask);
+        assert_eq!(units[0].kind, AuthorizationKind::Deny);
         assert_eq!(
             units[0].unit,
-            ShellCommandUnit::Opaque("'command env A=1 B=2 rm target'".into())
+            ShellCommandUnit::Parsed(argv(&["command", "env", "A=1", "B=2", "rm", "target"]))
         );
         assert_eq!(units[1].kind, AuthorizationKind::Ask);
         assert_eq!(client.calls.get(), 0);
@@ -1909,12 +1909,29 @@ mod tests {
     }
 
     #[test]
-    fn shell_assignment_prefixes_stay_opaque() {
-        let (_directory, config, policy) =
-            policy("shell_prefixes: ['bash -c']\nallow:\n  - printf hi\nask:\n  - '**'\n");
+    fn shell_assignment_prefixes_authorize_as_env_prefix() {
+        let (_directory, config, policy) = policy(
+            "prefixes:\n  - env GIT_EDITOR=true\nshell_prefixes: ['bash -c']\nallow:\n  - printf hi\n  - git ** rebase\n",
+        );
         let client = QueueClient::new([Err("must not be called")]);
 
-        for script in ["FOO=$BAR printf hi", "FOO=*.go printf hi"] {
+        for (script, expected, kind) in [
+            (
+                "FOO=$BAR printf hi",
+                argv(&["env", "FOO=$BAR", "printf", "hi"]),
+                AuthorizationKind::Ask,
+            ),
+            (
+                "FOO=*.go printf hi",
+                argv(&["env", "FOO=*.go", "printf", "hi"]),
+                AuthorizationKind::Ask,
+            ),
+            (
+                "GIT_EDITOR=true git rebase --continue",
+                argv(&["env", "GIT_EDITOR=true", "git", "rebase", "--continue"]),
+                AuthorizationKind::Allow,
+            ),
+        ] {
             let command = argv(&["bash", "-c", script]);
             let outcome = authorize_invocation(&policy, &command, &config, true, None, &client);
 
@@ -1925,14 +1942,32 @@ mod tests {
             else {
                 panic!("expected shell dry-run");
             };
-            assert_eq!(aggregate_kind, AuthorizationKind::Ask, "{script:?}");
+            assert_eq!(aggregate_kind, kind, "{script:?}");
             assert_eq!(units.len(), 1, "{script:?}");
-            assert!(
-                matches!(units[0].unit, ShellCommandUnit::Opaque(_)),
+            assert_eq!(
+                units[0].unit,
+                ShellCommandUnit::Parsed(expected),
                 "{script:?}"
             );
-            assert!(units[0].matched.is_implicit(), "{script:?}");
         }
+        assert_eq!(client.calls.get(), 0);
+    }
+
+    #[test]
+    fn shell_bare_assignment_prefix_still_checks_deny_on_command() {
+        let (_directory, config, policy) =
+            policy("shell_prefixes: ['bash -c']\nallow: ['**']\ndeny: ['rm **']\n");
+        let client = QueueClient::new([approved(ApprovalScope::Once)]);
+        let command = argv(&["bash", "-c", "A=1 rm target"]);
+        let outcome = authorize_invocation(&policy, &command, &config, false, None, &client);
+
+        assert!(matches!(
+            outcome,
+            InvocationAuthorizationOutcome::Shell(ShellAuthorizationOutcome::Denied {
+                diagnostic: None,
+                ..
+            })
+        ));
         assert_eq!(client.calls.get(), 0);
     }
 

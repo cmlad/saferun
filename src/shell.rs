@@ -271,9 +271,7 @@ fn command_substitution_units(segment: &ShellSegment) -> Option<Vec<ShellCommand
         return None;
     }
     let argv = split_static_authorization_argv(source, &segment.substitutions)?;
-    if argv.is_empty() || argv.iter().any(|part| is_assignment(part)) {
-        return None;
-    }
+    let argv = authorization_command_argv(source, argv)?;
 
     units.push(ShellCommandUnit::Parsed(argv));
     Some(units)
@@ -292,10 +290,45 @@ fn literal_command_argv(command: &str) -> Option<Vec<String>> {
         return None;
     }
     let argv = split_literal_authorization_argv(command)?;
-    if argv.is_empty() || argv.iter().any(|part| is_assignment(part)) {
+    authorization_command_argv(command, argv)
+}
+
+/// Leading `NAME=value` words are authorized as an `env` prefix so configured
+/// `env` prefixes apply; assignment-shaped words after the command word are
+/// ordinary arguments. Assignment-only commands and dynamic or quoted
+/// assignment names stay opaque.
+fn authorization_command_argv(source: &str, mut argv: Vec<String>) -> Option<Vec<String>> {
+    let assignments = argv.iter().take_while(|part| is_assignment(part)).count();
+    if assignments == argv.len() {
         return None;
     }
+    if assignments > 0 {
+        if argv[..assignments].iter().any(|part| part.contains("$("))
+            || !has_unquoted_assignment_names(source, assignments)
+        {
+            return None;
+        }
+        argv.insert(0, "env".to_string());
+    }
     Some(argv)
+}
+
+fn has_unquoted_assignment_names(source: &str, count: usize) -> bool {
+    let mut rest = source;
+    for _ in 0..count {
+        rest = rest.trim_start_matches(is_shell_blank);
+        let Some(end) = first_shell_word_source_end(rest) else {
+            return false;
+        };
+        let Some((name, _)) = rest[..end].split_once('=') else {
+            return false;
+        };
+        if !is_assignment_key(name) {
+            return false;
+        }
+        rest = &rest[end..];
+    }
+    true
 }
 
 fn supported_static_redirection(
@@ -1705,12 +1738,90 @@ mod tests {
     }
 
     #[test]
+    fn assignment_shaped_words_after_the_command_word_are_arguments() {
+        assert_eq!(
+            unit_strings(&[
+                "bash",
+                "-c",
+                "gh api graphql -f query='{ a(b: \"c\") }'; make CC=$(which cc)",
+            ]),
+            vec![
+                ShellCommandUnit::Parsed(vec![
+                    "gh".into(),
+                    "api".into(),
+                    "graphql".into(),
+                    "-f".into(),
+                    "query={ a(b: \"c\") }".into(),
+                ]),
+                ShellCommandUnit::Parsed(vec!["which".into(), "cc".into()]),
+                ShellCommandUnit::Parsed(vec!["make".into(), "CC=$(which cc)".into()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn leading_assignments_are_authorized_as_env_prefix() {
+        assert_eq!(
+            unit_strings(&["bash", "-c", "A=1 B='x y' git status $(date) > out.log",]),
+            vec![opaque("A=1 B='x y' git status $(date) > out.log")]
+        );
+        assert_eq!(
+            unit_strings(&["bash", "-c", "A=1 B='x y' git status > out.log"]),
+            vec![
+                ShellCommandUnit::Parsed(vec![
+                    "env".into(),
+                    "A=1".into(),
+                    "B=x y".into(),
+                    "git".into(),
+                    "status".into(),
+                ]),
+                ShellCommandUnit::Redirection {
+                    operator: ">".into(),
+                    target: "out.log".into(),
+                },
+            ]
+        );
+        assert_eq!(
+            unit_strings(&["bash", "-c", "A=1 git log $(git rev-parse HEAD)"]),
+            vec![
+                ShellCommandUnit::Parsed(vec!["git".into(), "rev-parse".into(), "HEAD".into(),]),
+                ShellCommandUnit::Parsed(vec![
+                    "env".into(),
+                    "A=1".into(),
+                    "git".into(),
+                    "log".into(),
+                    "$(git rev-parse HEAD)".into(),
+                ]),
+            ]
+        );
+    }
+
+    #[test]
+    fn assignment_only_and_quoted_assignment_names_stay_opaque() {
+        for script in [
+            "A=1",
+            "A=1 B=2",
+            "auth=\"$USER:$HOME\"",
+            "'A'=1 git status",
+            "\"A=1\" git status",
+            "A\\=1 git status",
+        ] {
+            let units = unit_strings(&["bash", "-c", script]);
+            assert_eq!(units.len(), 1, "{script:?}: {units:?}");
+            assert!(
+                matches!(units[0], ShellCommandUnit::Opaque(_)),
+                "{script:?}: {units:?}"
+            );
+        }
+    }
+
+    #[test]
     fn unsupported_command_substitution_contexts_stay_opaque() {
         for script in [
             "$(echo rm) -rf target",
             "\"$(echo rm)\" target",
             "FOO=$(date) env",
-            "make CC=$(which cc)",
+            "A=1 B=$(date) env",
             "echo $(date) > out.log",
             "echo $(date) `date`",
             "echo $(date) $((1 + 2))",

@@ -210,7 +210,7 @@ fn units_from_segment(segment: &ShellSegment) -> Vec<ShellCommandUnit> {
     }
 
     if !segment.substitutions.is_empty() {
-        return vec![opaque(command)];
+        return command_substitution_units(segment).unwrap_or_else(|| vec![opaque(command)]);
     }
 
     if segment.redirection.is_none() {
@@ -228,6 +228,55 @@ fn units_from_segment(segment: &ShellSegment) -> Vec<ShellCommandUnit> {
     }
 
     vec![opaque(command)]
+}
+
+/// Authorizes each `$(...)` payload before the outer command, which keeps the
+/// substitution source as literal argv text. Any other substitution form, a
+/// substitution in the command word, or a redirection keeps the segment opaque.
+fn command_substitution_units(segment: &ShellSegment) -> Option<Vec<ShellCommandUnit>> {
+    if segment.redirection.is_some() {
+        return None;
+    }
+
+    let source = segment.command.as_str();
+    let leading = source.len() - source.trim_start().len();
+    let command_word_end = leading + first_shell_word_source_end(&source[leading..])?;
+    let mut units = Vec::new();
+    let mut masked = String::with_capacity(source.len());
+    let mut last_copied = 0;
+
+    for substitution in &segment.substitutions {
+        if substitution.start < command_word_end || substitution.start < last_copied {
+            return None;
+        }
+        let text = source.get(substitution.start..substitution.end)?;
+        let inner = text
+            .strip_prefix("$(")
+            .filter(|inner| !inner.starts_with('('))?
+            .strip_suffix(')')?;
+        units.extend(decompose_payload(
+            inner,
+            inner,
+            false,
+            Some(&substitution.pipeline),
+        ));
+
+        masked.push_str(&source[last_copied..substitution.start]);
+        masked.push('_');
+        last_copied = substitution.end;
+    }
+    masked.push_str(&source[last_copied..]);
+
+    if !is_literal_simple_command_source(&masked) {
+        return None;
+    }
+    let argv = split_static_authorization_argv(source, &segment.substitutions)?;
+    if argv.is_empty() || argv.iter().any(|part| is_assignment(part)) {
+        return None;
+    }
+
+    units.push(ShellCommandUnit::Parsed(argv));
+    Some(units)
 }
 
 fn opaque(command: &str) -> ShellCommandUnit {
@@ -1511,14 +1560,94 @@ mod tests {
     }
 
     #[test]
-    fn real_substitutions_adjacent_to_ansi_c_quotes_stay_opaque() {
-        let units = unit_strings(&["bash", "-c", r#"printf $'literal' "$(date)""#]);
-        assert_eq!(units.len(), 1);
-        assert!(matches!(units[0], ShellCommandUnit::Opaque(_)));
+    fn real_substitutions_adjacent_to_ansi_c_quotes_are_authorized_first() {
+        for script in [
+            r#"printf $'literal' "$(date)""#,
+            r#"printf $'literal' $(date)"#,
+        ] {
+            assert_eq!(
+                unit_strings(&["bash", "-c", script]),
+                vec![
+                    ShellCommandUnit::Parsed(vec!["date".into()]),
+                    ShellCommandUnit::Parsed(vec![
+                        "printf".into(),
+                        "literal".into(),
+                        "$(date)".into(),
+                    ]),
+                ],
+                "{script:?}"
+            );
+        }
+    }
 
-        let units = unit_strings(&["bash", "-c", r#"printf $'literal' $(date)"#]);
-        assert_eq!(units.len(), 1);
-        assert!(matches!(units[0], ShellCommandUnit::Opaque(_)));
+    #[test]
+    fn command_substitutions_authorize_inner_commands_before_outer_command() {
+        assert_eq!(
+            unit_strings(&[
+                "bash",
+                "-c",
+                "uv run pre-commit run --files $(git diff --name-only)",
+            ]),
+            vec![
+                ShellCommandUnit::Parsed(vec!["git".into(), "diff".into(), "--name-only".into(),]),
+                ShellCommandUnit::Parsed(vec![
+                    "uv".into(),
+                    "run".into(),
+                    "pre-commit".into(),
+                    "run".into(),
+                    "--files".into(),
+                    "$(git diff --name-only)".into(),
+                ]),
+            ]
+        );
+        assert_eq!(
+            unit_strings(&[
+                "bash",
+                "-c",
+                r#"echo "$(cat $(ls a) | wc -l)" ~/$(date) 2>/dev/null; git status"#,
+            ]),
+            vec![
+                ShellCommandUnit::Parsed(vec!["ls".into(), "a".into()]),
+                ShellCommandUnit::Parsed(vec!["cat".into(), "$(ls a)".into()]),
+                ShellCommandUnit::Parsed(vec!["wc".into(), "-l".into()]),
+                ShellCommandUnit::Parsed(vec!["date".into()]),
+                ShellCommandUnit::Parsed(vec![
+                    "echo".into(),
+                    "$(cat $(ls a) | wc -l)".into(),
+                    "~/$(date)".into(),
+                ]),
+                ShellCommandUnit::Parsed(vec!["git".into(), "status".into()]),
+            ]
+        );
+        assert_eq!(
+            unit_strings(&["bash", "-c", "echo $(cargo test || true)"]),
+            vec![
+                ShellCommandUnit::Opaque("'cargo test || true'".into()),
+                ShellCommandUnit::Parsed(vec!["echo".into(), "$(cargo test || true)".into()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn unsupported_command_substitution_contexts_stay_opaque() {
+        for script in [
+            "$(echo rm) -rf target",
+            "\"$(echo rm)\" target",
+            "FOO=$(date) env",
+            "make CC=$(which cc)",
+            "echo $(date) > out.log",
+            "echo $(date) `date`",
+            "echo $(date) $((1 + 2))",
+            "echo $(date) <(date)",
+            "echo ${VAR:-$(date)}",
+        ] {
+            let units = unit_strings(&["bash", "-c", script]);
+            assert_eq!(units.len(), 1, "{script:?}: {units:?}");
+            assert!(
+                matches!(units[0], ShellCommandUnit::Opaque(_)),
+                "{script:?}: {units:?}"
+            );
+        }
     }
 
     #[test]
@@ -2029,9 +2158,7 @@ mod tests {
     #[test]
     fn command_arithmetic_and_malformed_expansions_stay_opaque() {
         for script in [
-            "echo \"$(date)\" 2>/dev/null",
             "echo \"$((1 + 2))\" 2>/dev/null",
-            "echo $(date)",
             "echo `date`",
             "echo <(date)",
             "echo >(cat)",
@@ -2045,7 +2172,6 @@ mod tests {
             "echo ${}",
             "echo $",
             "echo $:",
-            "echo $(date)*",
             "echo ${VAR:-default}*.go",
             "echo $'unterminated",
             "echo $'bad \\xgg escape'",
@@ -2144,7 +2270,6 @@ mod tests {
             "echo hi &> file",
             "echo hi &> /dev/null",
             "echo hi > file extra",
-            "echo ~/$(date)",
             "echo ?",
             "echo [abc]",
             "echo file[0-9].go",

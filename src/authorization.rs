@@ -1748,8 +1748,9 @@ mod tests {
         else {
             panic!("expected shell denial");
         };
-        assert_eq!(units.len(), 1);
-        assert!(matches!(units[0].unit, ShellCommandUnit::Opaque(_)));
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].unit, ShellCommandUnit::Parsed(argv(&["date"])));
+        assert_eq!(units[0].kind, AuthorizationKind::Deny);
         assert_eq!(client.calls.get(), 0);
     }
 
@@ -1814,7 +1815,7 @@ mod tests {
         let (_directory, config, policy) =
             policy("shell_prefixes: ['bash -c']\nallow:\n  - git status\ndeny:\n  - rm **\nask:\n  - '**'\n");
         let client = QueueClient::new([approved(ApprovalScope::Once)]);
-        let command = argv(&["bash", "-c", r#"$'\x72m' target $(date)"#]);
+        let command = argv(&["bash", "-c", r#"$'\x72m' target $((1 + 2))"#]);
         let outcome =
             authorize_invocation(&policy, &command, &config, false, Some(&[8; 32]), &client);
 
@@ -1974,8 +1975,12 @@ mod tests {
         else {
             panic!("expected shell denial");
         };
-        assert_eq!(units.len(), 1);
-        assert!(matches!(units[0].unit, ShellCommandUnit::Opaque(_)));
+        assert_eq!(units.len(), 2);
+        assert_eq!(
+            units[0].unit,
+            ShellCommandUnit::Parsed(argv(&["rm", "target"]))
+        );
+        assert_eq!(units[0].kind, AuthorizationKind::Deny);
         assert_eq!(client.calls.get(), 0);
     }
 

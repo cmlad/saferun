@@ -91,7 +91,7 @@ The broker listens only on `/tmp/saferun-<effective-uid>/approval.sock`. Live `a
 
 `Allow` approves one execution. `Allow for session` applies the dropdown's selected scope. The dropdown contains:
 
-- every prefix of the effective command, starting with its executable
+- every prefix of the effective command, starting with the full command (the default) and narrowing to its executable
 - `Matched ask rule` for a configured `ask` match
 - `Allow all commands in this session`
 

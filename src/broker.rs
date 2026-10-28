@@ -453,12 +453,11 @@ struct SessionScopeOption {
 }
 
 /// Session-scope menu entries in display order. The first entry is the default
-/// grant: normally the effective executable, but exact unit scope for synthetic
-/// redirection approval commands.
+/// grant: the full effective command, narrowing toward the executable below it.
 fn session_scope_options(request: &ApprovalRequest) -> Vec<SessionScopeOption> {
     let effective = effective_command(request);
     let mut options = Vec::with_capacity(effective.len() + 2);
-    for parts in effective_command_session_parts(effective) {
+    for parts in effective_command_session_parts(effective).rev() {
         options.push(SessionScopeOption {
             title: session_scope_title(&effective[..parts]),
             selection: SessionSelection::EffectiveCommandPrefix { parts },
@@ -1606,12 +1605,12 @@ mod tests {
             session_scope_options(&direct),
             vec![
                 SessionScopeOption {
-                    title: "/usr/bin…".to_string(),
-                    selection: SessionSelection::EffectiveCommandPrefix { parts: 1 },
-                },
-                SessionScopeOption {
                     title: "/usr/bin… /tmp/fil…".to_string(),
                     selection: SessionSelection::EffectiveCommandPrefix { parts: 2 },
+                },
+                SessionScopeOption {
+                    title: "/usr/bin…".to_string(),
+                    selection: SessionSelection::EffectiveCommandPrefix { parts: 1 },
                 },
                 SessionScopeOption {
                     title: "Matched ask rule".to_string(),
@@ -1662,9 +1661,9 @@ mod tests {
         assert_eq!(
             wrapped_titles,
             [
-                "python3",
-                "python3 -c",
                 "python3 -c x",
+                "python3 -c",
+                "python3",
                 "Matched ask rule",
                 ALL_COMMANDS_SESSION_TITLE,
             ]
@@ -1767,17 +1766,23 @@ mod tests {
         assert_eq!(
             parse_prompt_choice(b"Allow for session 0\n", &options),
             Ok(PromptChoice::AllowSession(
-                SessionSelection::EffectiveCommandPrefix { parts: 1 }
+                SessionSelection::EffectiveCommandPrefix { parts: 2 }
             ))
         );
         assert_eq!(
             parse_prompt_choice(b"Allow for session 0\r\n", &options),
             Ok(PromptChoice::AllowSession(
-                SessionSelection::EffectiveCommandPrefix { parts: 1 }
+                SessionSelection::EffectiveCommandPrefix { parts: 2 }
             ))
         );
         assert_eq!(
             parse_prompt_choice(b"\"Allow for session 0\"\n", &options),
+            Ok(PromptChoice::AllowSession(
+                SessionSelection::EffectiveCommandPrefix { parts: 2 }
+            ))
+        );
+        assert_eq!(
+            parse_prompt_choice(b"Allow for session 1\n", &options),
             Ok(PromptChoice::AllowSession(
                 SessionSelection::EffectiveCommandPrefix { parts: 1 }
             ))

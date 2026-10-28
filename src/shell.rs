@@ -899,7 +899,7 @@ fn has_only_supported_top_level_operators(pipeline: &ParsedPipeline) -> bool {
 }
 
 fn matches_source_sequence(source: &str, pipeline: &ParsedPipeline) -> bool {
-    if source.contains('\n') {
+    if has_unquoted_newline(source) {
         return false;
     }
     if pipeline.segments.is_empty() {
@@ -931,6 +931,43 @@ fn matches_source_sequence(source: &str, pipeline: &ParsedPipeline) -> bool {
         remainder = trim_horizontal_start(after_semicolon);
     }
     remainder.is_empty()
+}
+
+/// Newlines inside single, double, or ANSI-C quotes are literal argument text;
+/// any other newline, including a backslash line continuation, is rejected.
+fn has_unquoted_newline(value: &str) -> bool {
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    let mut index = 0;
+
+    while let Some((character, next_index)) = char_at(value, index) {
+        if escaped {
+            escaped = false;
+            if character == '\n' && !double_quoted {
+                return true;
+            }
+            index = next_index;
+            continue;
+        }
+        match character {
+            '\n' if !single_quoted && !double_quoted => return true,
+            '\\' if !single_quoted => escaped = true,
+            '\'' if !double_quoted => single_quoted = !single_quoted,
+            '"' if !single_quoted => double_quoted = !double_quoted,
+            '$' if !single_quoted && !double_quoted && value[next_index..].starts_with('\'') => {
+                let Some(end) = ansi_c_quote_source_end(value, next_index) else {
+                    return true;
+                };
+                index = end;
+                continue;
+            }
+            _ => {}
+        }
+        index = next_index;
+    }
+
+    false
 }
 
 fn trim_horizontal_start(value: &str) -> &str {
@@ -1065,7 +1102,9 @@ fn split_authorization_argv(
                 current.push_str(&value[index..end]);
                 index = end;
             }
-            '`' | '?' | '[' | '{' | '}' | '|' | '&' | ';' | '(' | ')' | '<' | '>' => return None,
+            '`' | '?' | '[' | '{' | '}' | '|' | '&' | ';' | '(' | ')' | '<' | '>' | '\n' => {
+                return None
+            }
             _ => {
                 current.push(character);
                 index = next_index;
@@ -1626,6 +1665,43 @@ mod tests {
                 ShellCommandUnit::Parsed(vec!["echo".into(), "$(cargo test || true)".into()]),
             ]
         );
+    }
+
+    #[test]
+    fn quoted_newlines_stay_argument_text() {
+        assert_eq!(
+            unit_strings(&[
+                "bash",
+                "-c",
+                "git add a && git commit -m 'subject\n\nbody' && echo \"x\ny\" $'p\nq'",
+            ]),
+            vec![
+                ShellCommandUnit::Parsed(vec!["git".into(), "add".into(), "a".into()]),
+                ShellCommandUnit::Parsed(vec![
+                    "git".into(),
+                    "commit".into(),
+                    "-m".into(),
+                    "subject\n\nbody".into(),
+                ]),
+                ShellCommandUnit::Parsed(vec!["echo".into(), "x\ny".into(), "p\nq".into()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn unquoted_newlines_stay_opaque() {
+        for script in [
+            "git status\ngit diff",
+            "git status \\\n --short",
+            "echo 'a\nb'\nrm target",
+        ] {
+            let units = unit_strings(&["bash", "-c", script]);
+            assert_eq!(units.len(), 1, "{script:?}: {units:?}");
+            assert!(
+                matches!(units[0], ShellCommandUnit::Opaque(_)),
+                "{script:?}: {units:?}"
+            );
+        }
     }
 
     #[test]

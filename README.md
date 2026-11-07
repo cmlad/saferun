@@ -85,6 +85,17 @@ With an installed binary:
 saferun-approval
 ```
 
+As a menu bar app:
+
+```bash
+./build-app.sh            # installs ~/Applications/SafeRun Approval.app
+open -a "SafeRun Approval"
+```
+
+The broker shows an `SR` item in the menu bar with `Copy log file path` and `Quit`. Quitting the item stops the broker. The app has no Dock icon and does not start at login.
+
+The broker writes timestamped stdout/stderr to `~/Library/Logs/saferun/approval.log` (mode 0600); when started from a terminal, output is also echoed there.
+
 The broker listens only on `/tmp/saferun-<effective-uid>/approval.sock`. Live `ask` decisions fail closed if the broker is absent or invalid. Direct allow/deny decisions and `--dry-run` do not need it. Other Unix systems build both binaries, but live approval is macOS-only.
 
 ## Approval Scopes

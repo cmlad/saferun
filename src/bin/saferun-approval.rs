@@ -1,10 +1,12 @@
 use std::env;
 use std::io;
-use std::process::ExitCode;
+use std::process::{self, ExitCode};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use saferun::approval::BrokerEndpoint;
+use saferun::{applog, status_item};
 use saferun::broker::{handle_connection, SessionCache, SystemPrompter};
 fn usage() {
     println!("usage: saferun-approval [-h]");
@@ -24,11 +26,25 @@ fn run() -> Result<(), String> {
         }
     }
 
+    let log_path = applog::default_log_path()?;
+    applog::redirect_output_to_log(&log_path)?;
+
     let endpoint = BrokerEndpoint::bind().map_err(|error| error.to_string())?;
     println!(
         "saferun-approval: listening on {}",
         endpoint.path().display()
     );
+
+    let mut status_item = status_item::spawn(&log_path)?;
+    // Hold the helper's stdin open for the broker's lifetime: it sees EOF and
+    // quits when the broker exits. `Child::wait` would otherwise close it.
+    let status_stdin = status_item.stdin.take();
+    thread::spawn(move || {
+        let _status_stdin = status_stdin;
+        let status = status_item.wait();
+        eprintln!("saferun-approval: status item exited ({status:?}); shutting down");
+        exit_after_log_flush(0);
+    });
 
     let cache = Arc::new(Mutex::new(SessionCache::with_capacity(4_096)));
     let prompter = Arc::new(Mutex::new(SystemPrompter::new()));
@@ -49,12 +65,18 @@ fn run() -> Result<(), String> {
     }
 }
 
+/// Give the log pipe thread a moment to write the final lines, then exit.
+fn exit_after_log_flush(code: i32) -> ! {
+    thread::sleep(Duration::from_millis(200));
+    process::exit(code);
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("saferun-approval: {message}");
-            ExitCode::from(1)
+            exit_after_log_flush(1);
         }
     }
 }

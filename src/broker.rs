@@ -405,10 +405,13 @@ pub fn build_prompt(request: &ApprovalRequest) -> String {
         } else {
             ("Command", index + 1 - consumed)
         };
-        prompt.push_str(&format!(
-            "{role} {number}: {}\n",
+        // An empty argument (e.g. `sed -i ''`) would otherwise render as a blank line.
+        let rendered = if part.is_empty() {
+            "''".to_string()
+        } else {
             render_authorization_bytes_unquoted(part.as_bytes())
-        ));
+        };
+        prompt.push_str(&format!("{role} {number}: {rendered}\n"));
     }
     if request.implicit_ask {
         prompt.push_str("\nNo matched rule\n");
@@ -436,6 +439,26 @@ pub fn build_prompt(request: &ApprovalRequest) -> String {
     let fingerprint = request.session_digest.get(..8).unwrap_or("invalid");
     prompt.push_str(&format!("Session: {fingerprint}"));
     prompt
+}
+
+/// Command argv as one POSIX shell-quoted line for the copy button.
+fn build_copy_text(request: &ApprovalRequest) -> String {
+    request
+        .command
+        .iter()
+        .map(|part| {
+            let safe = !part.is_empty()
+                && part.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte)
+                });
+            if safe {
+                part.clone()
+            } else {
+                format!("'{}'", part.replace('\'', r"'\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Panel title carrying the canonical working directory.
@@ -474,6 +497,35 @@ fn session_scope_options(request: &ApprovalRequest) -> Vec<SessionScopeOption> {
         selection: SessionSelection::AllCommands,
     });
     options
+}
+
+/// Where each session-scope option is offered on the panel: effective-prefix
+/// grants sit beside the prompt line of their last argv part, so the topmost
+/// button is the widest prefix; other scopes get their own bottom-row button.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct SessionButtonLayout {
+    /// (prompt line index, option index) pairs.
+    line_buttons: Vec<(usize, usize)>,
+    ask_rule: Option<usize>,
+    all_commands: Option<usize>,
+}
+
+fn session_button_layout(
+    request: &ApprovalRequest,
+    options: &[SessionScopeOption],
+) -> SessionButtonLayout {
+    let consumed = usize::try_from(request.prefix_parts_consumed).unwrap_or(0);
+    let mut layout = SessionButtonLayout::default();
+    for (index, option) in options.iter().enumerate() {
+        match option.selection {
+            SessionSelection::EffectiveCommandPrefix { parts } => {
+                layout.line_buttons.push((consumed + parts - 1, index));
+            }
+            SessionSelection::MatchedAskRule => layout.ask_rule = Some(index),
+            SessionSelection::AllCommands => layout.all_commands = Some(index),
+        }
+    }
+    layout
 }
 
 /// Join effective argv parts for a menu title, truncating each to 8 chars + ellipsis.
@@ -578,27 +630,39 @@ impl Prompter for SystemPrompter {
             .map_err(|_| PromptError::new("cannot encode approval display"))?;
         let title_json = serde_json::to_string(&build_prompt_title(request))
             .map_err(|_| PromptError::new("cannot encode approval display"))?;
+        let copy_text_json = serde_json::to_string(&build_copy_text(request))
+            .map_err(|_| PromptError::new("cannot encode approval display"))?;
         let options = session_scope_options(request);
-        let mut popup_setup = String::new();
-        if options.is_empty() {
-            popup_setup.push_str("    popup.addItemWithTitle(\"No session scope available\");\n");
-        } else {
-            for option in &options {
-                let title = serde_json::to_string(&option.title)
-                    .map_err(|_| PromptError::new("cannot encode approval display"))?;
-                popup_setup.push_str(&format!("    popup.addItemWithTitle({title});\n"));
-            }
-        }
-        let disable_controls = if options.is_empty() {
-            "    sessionButton.setEnabled(false);\n    popup.setEnabled(false);\n"
-        } else {
-            ""
-        };
+        let layout = session_button_layout(request, &options);
+        let line_buttons_json = serde_json::to_string(
+            &layout
+                .line_buttons
+                .iter()
+                .map(|&(line, option)| {
+                    serde_json::json!({
+                        "line": line,
+                        "option": option,
+                        "tooltip": options[option].title,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|_| PromptError::new("cannot encode approval display"))?;
+        let ask_rule_option = layout.ask_rule.map_or(-1, |index| index as i64);
+        let all_commands_option = layout.all_commands.map_or(-1, |index| index as i64);
+        let command_lines = request.command.len();
         let program = format!(
             r#"ObjC.import("Cocoa");
 const app = $.NSApplication.sharedApplication;
 const prompt = {prompt_json};
 const windowTitle = {title_json};
+const copyText = {copy_text_json};
+const lineButtons = {line_buttons_json};
+const askRuleOption = {ask_rule_option};
+const allCommandsOption = {all_commands_option};
+const commandLines = {command_lines};
+// Session buttons carry tag sessionTagBase + option index.
+const sessionTagBase = 2000;
 let choice = "Deny";
 try {{
     if (!app.setActivationPolicy($.NSApplicationActivationPolicyAccessory)) {{
@@ -612,12 +676,24 @@ try {{
                 implementation: function(sender) {{
                     app.stopModalWithCode(sender.tag);
                 }}
+            }},
+            "copyCommand:": {{
+                types: ["void", ["id"]],
+                implementation: function(sender) {{
+                    const pasteboard = $.NSPasteboard.generalPasteboard;
+                    pasteboard.clearContents;
+                    pasteboard.setStringForType($(copyText), $.NSPasteboardTypeString);
+                    sender.setTitle("Copied");
+                }}
             }}
         }}
     }});
     const controller = $.SaferunApprovalController.alloc.init;
     const width = 720;
     const textWidth = width - 28;
+    const inset = 4;
+    // Left-hand column holding the per-line session buttons.
+    const columnWidth = 140;
     const textView = $.NSTextView.alloc.initWithFrame(
         $.NSMakeRect(0, 0, textWidth, 1)
     );
@@ -626,12 +702,42 @@ try {{
     textView.setDrawsBackground(false);
     textView.setSelectable(true);
     textView.setFont($.NSFont.userFixedPitchFontOfSize(13));
-    textView.setTextContainerInset($.NSMakeSize(4, 4));
+    // Extra paragraph spacing so adjacent line buttons do not overlap.
+    const paragraphStyle = $.NSMutableParagraphStyle.alloc.init;
+    paragraphStyle.setParagraphSpacing(6);
+    textView.textStorage.addAttributeValueRange(
+        $.NSParagraphStyleAttributeName,
+        paragraphStyle,
+        $.NSMakeRange(0, textView.string.length)
+    );
+    textView.setTextContainerInset($.NSMakeSize(inset, inset));
     textView.setHorizontallyResizable(false);
     textView.setVerticallyResizable(true);
-    textView.textContainer.setContainerSize($.NSMakeSize(textWidth - 8, 1000000));
+    textView.textContainer.setContainerSize($.NSMakeSize(textWidth - 2 * inset, 1000000));
     textView.textContainer.setWidthTracksTextView(true);
-    textView.layoutManager.ensureLayoutForTextContainer(textView.textContainer);
+    const lineStarts = [];
+    let lineStart = 0;
+    for (const line of prompt.split("\n")) {{
+        lineStarts.push(lineStart);
+        lineStart += line.length + 1;
+    }}
+    function excludeButtonColumn(height) {{
+        textView.textContainer.setExclusionPaths($.NSArray.arrayWithObject(
+            $.NSBezierPath.bezierPathWithRect($.NSMakeRect(0, 0, columnWidth, height))
+        ));
+        textView.layoutManager.ensureLayoutForTextContainer(textView.textContainer);
+    }}
+    function lineTop(line) {{
+        const glyph = textView.layoutManager.glyphIndexForCharacterAtIndex(lineStarts[line]);
+        return Number(
+            textView.layoutManager.lineFragmentRectForGlyphAtIndexEffectiveRange(glyph, null)
+                .origin.y
+        );
+    }}
+    // Indent only the command lines; the diagnostics below them start at the
+    // left edge, under the buttons.
+    excludeButtonColumn(1000000);
+    excludeButtonColumn(lineTop(commandLines));
     const usedTextHeight = Number(
         textView.layoutManager.usedRectForTextContainer(textView.textContainer).size.height
     );
@@ -656,6 +762,37 @@ try {{
     scrollView.setDocumentView(textView);
     window.contentView.addSubview(scrollView);
 
+    // Small button in the left column, aligned to the first visual line of a prompt line.
+    function addLineButton(line, buttonTitle, action, tag) {{
+        const button = $.NSButton.alloc.initWithFrame(
+            $.NSMakeRect(
+                inset,
+                inset + lineTop(line) - 2,
+                columnWidth - 8,
+                20
+            )
+        );
+        button.setTitle(buttonTitle);
+        button.setBezelStyle($.NSBezelStyleRounded);
+        button.setControlSize($.NSControlSizeSmall);
+        button.setFont($.NSFont.systemFontOfSize($.NSFont.smallSystemFontSize));
+        button.setTarget(controller);
+        button.setAction(action);
+        button.setTag(tag);
+        button.setRefusesFirstResponder(true);
+        textView.addSubview(button);
+        return button;
+    }}
+    for (const entry of lineButtons) {{
+        const button = addLineButton(
+            entry.line,
+            "Allow for session",
+            "choose:",
+            sessionTagBase + entry.option
+        );
+        button.setToolTip(entry.tooltip);
+    }}
+
     const focusSink = $.NSTextView.alloc.initWithFrame($.NSMakeRect(1, 1, 1, 1));
     focusSink.setDrawsBackground(false);
     focusSink.setTextColor($.NSColor.clearColor);
@@ -675,15 +812,21 @@ try {{
         window.contentView.addSubview(button);
         return button;
     }}
-    const popup = $.NSPopUpButton.alloc.initWithFramePullsDown(
-        $.NSMakeRect(14, 10, 306, 32),
-        false
-    );
-    const sessionButton = addButton("Allow for session", 328, 148, 1000, "");
-    addButton("Deny", 494, 100, 1002, "");
-    addButton("Allow", 606, 100, 1001, "");
-{popup_setup}    window.contentView.addSubview(popup);
-{disable_controls}
+    if (allCommandsOption >= 0) {{
+        addButton("Allow all for session", 14, 250, sessionTagBase + allCommandsOption, "");
+    }}
+    // Copy sits centered between the session and decision buttons unless the
+    // ask-rule button needs that space.
+    let copyX = 356;
+    if (askRuleOption >= 0) {{
+        copyX = 272;
+        addButton("Ask rule for session", 350, 160, sessionTagBase + askRuleOption, "");
+    }}
+    const copyButton = addButton("Copy", copyX, 70, 0, "");
+    copyButton.setAction("copyCommand:");
+    copyButton.setRefusesFirstResponder(true);
+    addButton("Deny", 518, 90, 1002, "");
+    addButton("Allow", 616, 90, 1001, "");
     window.setInitialFirstResponder(focusSink);
     app.activateIgnoringOtherApps(true);
     window.center;
@@ -691,10 +834,8 @@ try {{
     window.makeFirstResponder(focusSink);
     const response = Number(app.runModalForWindow(window));
     window.orderOut($());
-    if (response === 1000) {{
-        const selectedIndex = Number(popup.indexOfSelectedItem);
-        choice = "Allow for session "
-            + (Number.isNaN(selectedIndex) ? "invalid" : String(selectedIndex));
+    if (response >= sessionTagBase) {{
+        choice = "Allow for session " + String(response - sessionTagBase);
     }} else if (response === 1001) {{
         choice = "Allow";
     }}
@@ -1596,6 +1737,57 @@ mod tests {
         let prompt = build_prompt(&request);
         assert!(prompt.contains("\nNo matched rule\n"));
         assert!(!prompt.contains("Ask rule:"));
+
+        request.command = vec!["sed".to_string(), "-i".to_string(), String::new()];
+        request.prefix_rule_source = None;
+        request.prefix_parts_consumed = 0;
+        assert!(build_prompt(&request).starts_with(concat!(
+            "Command 1: sed\n",
+            "Command 2: -i\n",
+            "Command 3: ''\n",
+        )));
+    }
+
+    #[test]
+    fn copy_text_is_shell_quoted_command_line() {
+        let mut request = request();
+        request.command = vec![
+            "xargs".to_string(),
+            "grep".to_string(),
+            "-l".to_string(),
+            "machine_types".to_string(),
+            "it's a | b".to_string(),
+            String::new(),
+        ];
+        assert_eq!(
+            build_copy_text(&request),
+            r"xargs grep -l machine_types 'it'\''s a | b' ''"
+        );
+    }
+
+    #[test]
+    fn session_buttons_sit_beside_their_last_prompt_line() {
+        let mut request = request();
+        request.command = vec![
+            "env".to_string(),
+            "X=1".to_string(),
+            "git".to_string(),
+            "status".to_string(),
+        ];
+        request.prefix_rule_source = Some("env *".to_string());
+        request.prefix_parts_consumed = 2;
+        request.implicit_ask = false;
+        let options = session_scope_options(&request);
+        let layout = session_button_layout(&request, &options);
+        assert_eq!(layout.line_buttons, vec![(3, 0), (2, 1)]);
+        assert_eq!(layout.ask_rule, Some(2));
+        assert_eq!(layout.all_commands, Some(3));
+
+        request.implicit_ask = true;
+        let options = session_scope_options(&request);
+        let layout = session_button_layout(&request, &options);
+        assert_eq!(layout.ask_rule, None);
+        assert_eq!(layout.all_commands, Some(2));
     }
 
     #[test]
